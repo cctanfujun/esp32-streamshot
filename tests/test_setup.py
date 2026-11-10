@@ -23,7 +23,12 @@ class SetupTests(unittest.TestCase):
         with self.assertRaises(ValueError): setup.configuration(state='relative')
 
     def test_explicit_port_checks_type_without_open(self):
-        with patch.object(setup.os, 'stat', return_value=type('Info', (), {'st_mode': stat.S_IFCHR})()) as checked:
+        real_stat = setup.os.stat
+        def device_stat(path, *args, **kwargs):
+            if str(path) == '/dev/cu.usbmodemTEST':
+                return type('Info', (), {'st_mode': stat.S_IFCHR})()
+            return real_stat(path, *args, **kwargs)
+        with patch.object(setup.os, 'stat', side_effect=device_stat) as checked:
             with patch('builtins.open', side_effect=AssertionError('must not open a device')):
                 value = setup.configuration('/dev/cu.usbmodemTEST')
         checked.assert_called()

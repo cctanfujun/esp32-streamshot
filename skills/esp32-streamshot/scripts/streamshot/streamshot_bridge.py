@@ -37,6 +37,10 @@ MAX_IMAGE = 1024 * 1024
 MAX_JSON = 4096
 MAX_SEQUENCE = 2147483647
 SCREEN_RECOVERY_PROTOCOL = 'resume-from-v1'
+CAPTURE_PROTOCOL = 'settle-ticket-v1'
+MAX_SETTLE_MS = 1000
+FRAME_TIMINGS = {'capture-wait-ms': 'capture_wait_ms', 'encode-ms': 'encode_ms',
+                 'callback-age-ms': 'source_callback_age_ms'}
 SCREEN_INACTIVE_REASONS = frozenset(('owner_pause', 'owner_end', 'agent_stop',
                                    'heartbeat_timeout', 'lease_expired', 'bridge_shutdown'))
 
@@ -140,6 +144,12 @@ def reset_arguments(value):
     uid(value['id'])
     if value['session_id'] is not None:
         uid(value['session_id'])
+
+
+def screen_arguments(value):
+    if not isinstance(value, dict) or set(value) not in (set(), {'settle_ms'}):
+        raise Failure('invalid_fields')
+    return integer(value.get('settle_ms', 0), 0, MAX_SETTLE_MS)
 
 
 class UnavailableController:
@@ -371,6 +381,7 @@ class Session:
         self.pending = None
         self.result = None
         self.capture_busy = False
+        self.phone_capture_protocol = None
         self.closed = set()
         self.commands = {}
         self.input_busy = False
@@ -490,6 +501,8 @@ class Session:
                 fields |= {'allow_control'}
             if 'resume_from' in value:
                 fields |= {'resume_from'}
+            if 'capture_protocol' in value:
+                fields |= {'capture_protocol'}
         elif state == 'geometry': fields |= {'geometry_epoch', 'width', 'height', 'orientation'}
         elif state not in ('pause', 'end'): raise Failure('invalid_session_state')
         exact(value, fields); uid(value['session_id'])
@@ -509,6 +522,9 @@ class Session:
             if state == 'start':
                 if 'allow_control' in value and type(value['allow_control']) is not bool:
                     raise Failure('invalid_control_permission')
+                capture_protocol = value.get('capture_protocol')
+                if 'capture_protocol' in value and capture_protocol != CAPTURE_PROTOCOL:
+                    raise Failure('unsupported_capture_protocol')
                 if identity in self.closed:
                     self._inactive_phone_failure(identity, principal)
                     raise Failure('session_conflict', 409)
@@ -517,6 +533,8 @@ class Session:
                 if self.active:
                     if self.owner != principal:
                         raise Failure('session_owner_mismatch', 403)
+                    if capture_protocol != self.phone_capture_protocol:
+                        raise Failure('capture_protocol_changed', 409)
                     if previous is not None:
                         self._resume_predecessor(previous, identity, principal, replay=True)
                     return
@@ -528,6 +546,7 @@ class Session:
                     self.resume_successors[previous] = identity
                 self.identity, self.active = identity, True
                 self.owner = principal
+                self.phone_capture_protocol = capture_protocol
                 self.allow_control = False
                 self.control_identity = None
                 self.control_reset_required = False
@@ -567,22 +586,44 @@ class Session:
         if old:
             self.controller.stop(old)
 
-    def poll(self, identity, timeout=8, principal=None):
+    def poll(self, identity, timeout=8, principal=None, outcome=None):
         uid(identity)
+        if outcome is not None:
+            exact(outcome, {'request_id', 'status'})
+            uid(outcome['request_id'])
+            if outcome['status'] not in ('no_video_sample', 'ticket_expired'):
+                raise Failure('invalid_capture_outcome')
         with self.condition:
             self._require(identity, principal)
             self.last_heartbeat = self.clock()
+            if (outcome is not None and self.pending is not None
+                    and self.pending['id'] == outcome['request_id']):
+                self.result = {'capture_error': 'capture_' + outcome['status']}
+                self.pending = None
+                self.condition.notify_all()
+                return None
             self.condition.wait_for(lambda: self.pending is not None or not self.active, timeout)
             self._require(identity, principal)
             self.last_heartbeat = self.clock()
             if self.pending and self.pending['deadline'] > self.clock():
-                return {'v': 1, 'session_id': identity, 'request_id': self.pending['id'],
-                        'ttl_ms': min(5000, max(1, int((self.pending['deadline'] - self.clock()) * 1000)))}
+                ttl = min(5000, max(1, int((self.pending['deadline'] - self.clock()) * 1000)))
+                result = {'v': 1, 'session_id': identity, 'request_id': self.pending['id'], 'ttl_ms': ttl}
+                if self.phone_capture_protocol == CAPTURE_PROTOCOL:
+                    result['settle_ms'] = min(self.pending.get('settle_ms', 0), ttl)
+                return result
             return None
 
     def accept_frame(self, values, data, principal=None):
         expected = {'session', 'request', 'sequence', 'width', 'height', 'orientation', 'geometry-epoch'}
-        exact(values, expected)
+        if not isinstance(values, dict) or set(values) - expected - set(FRAME_TIMINGS) or not expected <= set(values):
+            raise Failure('invalid_fields')
+        timings = {}
+        for name, field in FRAME_TIMINGS.items():
+            if name in values:
+                if (not isinstance(values[name], str) or not re.fullmatch(r'[0-9]{1,4}', values[name])
+                        or int(values[name]) > 5000):
+                    raise Failure('invalid_frame_timings')
+                timings[field] = int(values[name])
         identity, request = uid(values['session']), uid(values['request'])
         parsed = {}
         for key in expected - {'session', 'request'}:
@@ -597,6 +638,9 @@ class Session:
         digest = hashlib.sha256(data).hexdigest()
         with self.condition:
             self._require(identity, principal)
+            if ((self.phone_capture_protocol == CAPTURE_PROTOCOL and len(timings) != len(FRAME_TIMINGS))
+                    or (self.phone_capture_protocol is None and timings)):
+                raise Failure('invalid_frame_timings')
             if self.frame and request == self.frame['request_id']:
                 if sequence == self.frame['sequence'] and digest == self.frame['digest']:
                     return
@@ -607,23 +651,31 @@ class Session:
             if self.geometry is not None and geometry != self.geometry:
                 raise Failure('geometry_changed_request_again', 409)
             self.geometry = geometry; self.sequence = sequence
+            now = self.clock()
+            observed = min(self.pending['created_at'], now - timings['source_callback_age_ms'] / 1000) if timings else now
             self.frame = {'frame_id': str(uuid.uuid4()), 'session_id': identity, 'request_id': request,
                           'sequence': sequence, 'width': geometry[1], 'height': geometry[2],
-                          'orientation': geometry[3], 'geometry_epoch': geometry[0], 'received': self.clock(),
+                          'orientation': geometry[3], 'geometry_epoch': geometry[0], 'received': observed,
                           'digest': digest, 'jpeg': data,
                           'observation_epoch': self.pending['observation_epoch']}
+            if timings:
+                self.frame.update(timings, observation_age_ms=min(5000, max(0, int((now - observed) * 1000))))
             self.result = self.frame; self.pending = None
             self.last_heartbeat = self.clock()
             self.condition.notify_all()
 
-    def capture(self, timeout=8):
+    def capture(self, timeout=8, settle_ms=0):
+        integer(settle_ms, 0, MAX_SETTLE_MS)
         with self.condition:
             self._require(self.identity)
+            if settle_ms and self.phone_capture_protocol != CAPTURE_PROTOCOL:
+                raise Failure('phone_settle_unsupported', 409)
             if self.capture_busy:
                 raise Failure('capture_busy', 409)
             self.capture_busy = True
             self.result = None
-            self.pending = {'id': str(uuid.uuid4()), 'deadline': self.clock() + 5,
+            self.pending = {'id': str(uuid.uuid4()), 'deadline': self.clock() + 5, 'created_at': self.clock(),
+                            'settle_ms': settle_ms,
                             'observation_epoch': self.observation_epoch}
             identity = self.identity
             self.condition.notify_all()
@@ -636,6 +688,8 @@ class Session:
                         self.screen_request_timeouts = min(MAX_SEQUENCE, self.screen_request_timeouts + 1)
                     raise Failure('capture_not_received', 408)
                 result = self.result
+                if 'capture_error' in result:
+                    raise Failure(result['capture_error'], 408)
                 self.unknown = False
                 return result
             finally:
@@ -795,6 +849,8 @@ class Session:
             return {'v': 1, 'active': self.active, 'allow_control': self.allow_control,
                     'control_protocol': 'desktop-lease-v1',
                     'sharing_protocol': SCREEN_RECOVERY_PROTOCOL,
+                    'capture_protocol': CAPTURE_PROTOCOL,
+                    'phone_capture_protocol': self.phone_capture_protocol if self.active else None,
                     'control_reset_required': self.control_reset_required,
                     'last_inactive_reason': self.last_inactive_reason,
                     'heartbeat_age_seconds': min(1800, max(0, int(self.clock() - self.last_heartbeat))) if self.active else None,
@@ -881,9 +937,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
+        if isinstance(value, dict):
+            disposition = {'phone_settle_unsupported': 'phone_settle_unsupported',
+                           'capture_no_video_sample': 'no_video_sample', 'capture_ticket_expired': 'ticket_expired'}.get(value.get('error'))
+            if disposition is not None:
+                self.send_header('X-StreamShot-Capture-Error', disposition)
         if metadata:
             for key in ('frame_id', 'session_id', 'width', 'height', 'orientation', 'geometry_epoch'):
                 self.send_header('X-StreamShot-' + key.replace('_', '-'), str(metadata[key]))
+            for key in (*FRAME_TIMINGS.values(), 'observation_age_ms'):
+                if key in metadata:
+                    self.send_header('X-StreamShot-' + key.replace('_', '-'), str(metadata[key]))
         self.end_headers()
         if data:
             self.wfile.write(data)
@@ -928,7 +992,13 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
             if set(query) != {'session_id'} or len(query['session_id']) != 1:
                 raise Failure('invalid_query')
-            value = self.server.session.poll(query['session_id'][0], principal=principal)
+            outcome = None
+            fields = ('X-StreamShot-Capture-Outcome', 'X-StreamShot-Capture-Request-Id')
+            if any(self.headers.get(name) is not None for name in fields):
+                if any(len(self.headers.get_all(name, [])) != 1 for name in fields):
+                    raise Failure('invalid_capture_outcome')
+                outcome = {'status': self.headers[fields[0]], 'request_id': self.headers[fields[1]]}
+            value = self.server.session.poll(query['session_id'][0], principal=principal, outcome=outcome)
             return self._reply(200 if value else 204, value)
         if parsed.query:
             raise Failure('query_not_allowed')
@@ -941,11 +1011,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == 'POST' and path == '/v1/frame':
             headers = {key: self.headers.get('X-StreamShot-' + key) for key in
                        ('session', 'request', 'sequence', 'width', 'height', 'orientation', 'geometry-epoch')}
+            for key in FRAME_TIMINGS:
+                name = 'X-StreamShot-' + key
+                if self.headers.get(name) is not None:
+                    if len(self.headers.get_all(name, [])) != 1:
+                        raise Failure('invalid_frame_timings')
+                    headers[key] = self.headers[name]
             self.server.session.accept_frame(headers, self._body(image=True), principal=principal)
             return self._reply(201, {'ok': True})
         if self.command == 'POST' and path == '/v1/screen':
-            exact(self._body(), set())
-            value = self.server.session.capture()
+            settle = screen_arguments(self._body())
+            value = self.server.session.capture(settle_ms=settle)
             return self._reply(200, image=value['jpeg'], metadata=value)
         if self.command == 'POST' and path == '/v1/actions':
             return self._reply(200, self.server.session.action(self._body()))

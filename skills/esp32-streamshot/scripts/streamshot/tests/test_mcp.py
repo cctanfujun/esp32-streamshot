@@ -39,11 +39,14 @@ class FakeClient:
     def request(self, method, path, value=None, image=False):
         self.calls.append((method, path, copy.deepcopy(value), image))
         if path == '/v1/screen':
-            return dict(METADATA, frame_id=self.next_frame), JPEG
+            timings = dict(capture_wait_ms=value['settle_ms'], encode_ms=0,
+                           source_callback_age_ms=0, observation_age_ms=0) if value.get('settle_ms', 0) else {}
+            return dict(METADATA, frame_id=self.next_frame, **timings), JPEG
         if path == '/v1/status':
             return {'v': 1, 'active': self.active, 'allow_control': True,
                     'control_protocol': 'desktop-lease-v1',
                     'sharing_protocol': mcp.bridge.SCREEN_RECOVERY_PROTOCOL,
+                    'capture_protocol': mcp.bridge.CAPTURE_PROTOCOL,
                     'session_id': SESSION if self.active else None, 'has_observation': True,
                     'input_outcome_unknown': False, 'pairing_available': True,
                     'controller': {'available': True, 'armed': False, 'serial_port': '/PRIVATE_LOCAL_DEVICE'},
@@ -319,7 +322,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(summary['screen_status'], 'captured')
         self.assertEqual(summary['screen']['frame_id'], self.client.next_frame)
         self.assertEqual(base64.b64decode(result['content'][1]['data']), JPEG)
-        self.tools.sleep.assert_called_once_with(.25)
+        self.tools.sleep.assert_not_called()
+        self.assertEqual(self.client.calls[-1], ('POST', '/v1/screen', {'settle_ms': 250}, True))
         sent = [item[2] for item in self.client.calls if item[1] == '/v1/actions']
         self.assertEqual([item['op'] for item in sent], ['move', 'key', 'key', 'key', 'key'])
         self.assertEqual([(item['usage'], item['modifiers']) for item in sent[1:]],
@@ -476,12 +480,65 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(self.tools.control_reset_required)
         self.assertFalse(self.tools.input_unknown)
         self.assertIsNone(self.tools.observation)
-        self.tools.sleep.assert_called_once_with(1)
+        self.tools.sleep.assert_not_called()
+        self.assertEqual(self.client.calls[-1][2], {'settle_ms': 1000})
         before = copy.deepcopy(self.client.calls)
         tool(self.server, 'streamshot_act', args, 181)
         self.assertEqual(self.client.calls, before)
         self.assertTrue(tool(self.server, 'streamshot_act', args, 182)['result']['isError'])
         self.assertEqual(len([item for item in self.client.calls if item[1] == '/v1/actions']), 2)
+
+    def test_act_requests_ticket_immediately_and_reports_measured_bounded_times(self):
+        initialize(self.server)
+        tool(self.server, 'streamshot_get_screen', identity=190)
+        self.tools.timer = Mock(side_effect=[1, 2, 2, 4, 5])
+        result = tool(self.server, 'streamshot_act', act(settle_ms=500), 191)['result']
+        summary = json.loads(result['content'][0]['text'])
+        self.assertEqual({key: summary[key] for key in ('input_ms', 'capture_ms', 'total_ms')},
+                         dict(input_ms=1000, capture_ms=2000, total_ms=4000))
+        self.assertEqual(summary['screen']['capture_wait_ms'], 500)
+        self.assertEqual([item[1] for item in self.client.calls], ['/v1/screen', '/v1/actions', '/v1/screen'])
+        self.assertEqual(self.client.calls[-1][2], {'settle_ms': 500})
+        self.tools.sleep.assert_not_called()
+        before = copy.deepcopy(self.client.calls)
+        replay = tool(self.server, 'streamshot_act', act(settle_ms=500), 191)['result']
+        self.assertEqual(json.loads(replay['content'][0]['text'])['total_ms'], 4000)
+        self.assertEqual(self.client.calls, before)
+        self.assertEqual(self.tools._elapsed_ms(0, 1000000), mcp.MAX_TIMING_MS)
+        self.assertEqual(self.tools._elapsed_ms(2, 1), 0)
+
+    def test_new_capture_metrics_anchor_freshness_to_request_not_upload_completion(self):
+        initialize(self.server)
+        original = self.client.request
+        def slow_capture(method, path, value=None, image=False):
+            metadata, jpeg = original(method, path, value, image)
+            self.clock.return_value = 102
+            return dict(metadata, capture_wait_ms=900, encode_ms=50, source_callback_age_ms=100,
+                        observation_age_ms=1000), jpeg
+        self.client.request = slow_capture
+        screen = tool(self.server, 'streamshot_get_screen', identity=195)['result']
+        self.assertFalse(screen['isError'])
+        self.assertEqual(self.tools.observed_at, 100)
+        self.clock.return_value = 131
+        result = tool(self.server, 'streamshot_act', act(capture=False), 196)['result']
+        self.assertEqual(json.loads(result['content'][0]['text'])['error'], 'observe_again')
+        self.assertEqual(len(self.client.calls), 1)
+
+    def test_nonzero_settle_cannot_claim_success_with_legacy_metadata(self):
+        initialize(self.server)
+        tool(self.server, 'streamshot_get_screen', identity=197)
+        original = self.client.request
+        def legacy_capture(method, path, value=None, image=False):
+            result = original(method, path, value, image)
+            return (dict(METADATA), JPEG) if path == '/v1/screen' else result
+        self.client.request = legacy_capture
+        result = tool(self.server, 'streamshot_act', act(), 198)['result']
+        summary = json.loads(result['content'][0]['text'])
+        self.assertTrue(summary['ok'])
+        self.assertEqual(summary['acknowledged'], 1)
+        self.assertEqual(summary['screen_error'], 'invalid_frame_metadata')
+        self.assertFalse(self.tools.control_reset_required)
+        self.assertIsNone(self.tools.observation)
 
     def test_stop_has_no_frame_requirement_and_old_session_cannot_resume(self):
         initialize(self.server)
@@ -694,6 +751,19 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(sent.data, b'{}')
         self.assertEqual(client.opener.open.call_args.kwargs, {'timeout': 12})
         self.assertNotIn('PRIVATE_TOKEN', sent.full_url)
+
+    def test_capture_timing_metadata_is_all_or_none_and_strictly_bounded(self):
+        headers = {'X-StreamShot-' + key.replace('_', '-'): str(value) for key, value in METADATA.items()}
+        metrics = {'capture-wait-ms': '250', 'encode-ms': '12', 'source-callback-age-ms': '80', 'observation-age-ms': '300'}
+        headers.update({'X-StreamShot-' + key: value for key, value in metrics.items()})
+        self.assertEqual(mcp.header_metadata(headers, JPEG)['source_callback_age_ms'], 80)
+        for value in ('-1', '5001', '1.5', 'True', '+1'):
+            with self.assertRaisesRegex(mcp.SafeFailure, '^invalid_frame_metadata$'):
+                mcp.header_metadata(dict(headers, **{'X-StreamShot-encode-ms': value}), JPEG)
+        partial = dict(headers)
+        partial.pop('X-StreamShot-observation-age-ms')
+        with self.assertRaisesRegex(mcp.SafeFailure, '^invalid_frame_metadata$'):
+            mcp.header_metadata(partial, JPEG)
 
     def test_http_errors_do_not_read_body_or_retry(self):
         body = Mock()

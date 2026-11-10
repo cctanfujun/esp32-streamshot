@@ -80,6 +80,95 @@ class StateChecks(unittest.TestCase):
                            self.frame_headers(str(uuid.uuid4())), JPEG)
         self.assertEqual(self.controller.calls, [])
 
+    def test_settle_ticket_is_explicit_and_window_metrics_do_not_renew_observation_age(self):
+        state = bridge.Session(self.controller, self.clock)
+        identity = str(uuid.uuid4())
+        state.session(dict(v=1, session_id=identity, state='start', capture_protocol=bridge.CAPTURE_PROTOCOL))
+        self.assertIsNone(state.pending)
+        self.assertIsNone(state.frame)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(state.capture, .5, 250)
+            ticket = state.poll(identity, .2)
+            self.assertEqual(ticket['settle_ms'], 250)
+            self.assertLessEqual(ticket['settle_ms'], ticket['ttl_ms'])
+            self.clock.now = .4
+            headers = dict(self.frame_headers(ticket['request_id']), session=identity,
+                           **{'capture-wait-ms': '250', 'encode-ms': '20', 'callback-age-ms': '100'})
+            state.accept_frame(headers, JPEG)
+            frame = result.result(1)
+        self.assertEqual(frame['received'], 0)
+        self.assertEqual(frame['observation_age_ms'], 400)
+        self.assertEqual(frame['source_callback_age_ms'], 100)
+        self.clock.now = 1
+        state.accept_frame(dict(headers, **{'callback-age-ms': '0'}), JPEG)
+        self.assertEqual(state.frame['received'], 0)  # Duplicate receipt cannot rejuvenate its sample.
+        self.clock.now = 30.1
+        state.last_heartbeat = self.clock.now
+        action = dict(self.action(frame, button='left'), session_id=identity)
+        self.assertFailure('observe_again', state.action, action)
+        self.assertTrue(state.active)
+        self.assertEqual(self.controller.calls, [])
+
+    def test_old_phone_has_immediate_capture_but_cannot_silently_settle(self):
+        self.assertFailure('phone_settle_unsupported', self.state.capture, .001, 250)
+        self.assertIsNone(self.state.pending)
+        self.assertEqual(self.state.screen_request_timeouts, 0)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(self.state.capture, .5, 0)
+            ticket = self.state.poll(self.session, .2)
+            self.assertNotIn('settle_ms', ticket)
+            self.state.accept_frame(self.frame_headers(ticket['request_id']), JPEG)
+            self.assertNotIn('source_callback_age_ms', result.result(1))
+
+    def test_capture_capability_is_strict_and_cannot_change_on_an_idempotent_start(self):
+        value = dict(v=1, session_id=str(uuid.uuid4()), state='start')
+        state = bridge.Session(self.controller, self.clock)
+        for invalid in (None, False, [], 'idle-cache-v1'):
+            self.assertFailure('unsupported_capture_protocol', state.session, dict(value, capture_protocol=invalid))
+        state.session(dict(value, capture_protocol=bridge.CAPTURE_PROTOCOL))
+        state.session(dict(value, capture_protocol=bridge.CAPTURE_PROTOCOL))
+        self.assertFailure('capture_protocol_changed', state.session, value)
+        self.assertTrue(state.active)
+        self.assertFalse(state.allow_control)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(state.capture, .5, 0)
+            ticket = state.poll(value['session_id'], .2)
+            self.assertEqual(ticket['settle_ms'], 0)
+            headers = dict(self.frame_headers(ticket['request_id']), session=value['session_id'])
+            self.assertFailure('invalid_frame_timings', state.accept_frame, headers, JPEG)
+            state.accept_frame(dict(headers, **{'capture-wait-ms': '0', 'encode-ms': '0', 'callback-age-ms': '0'}), JPEG)
+            self.assertEqual(result.result(1)['received'], 0)
+
+    def test_no_video_outcome_is_ticket_and_owner_bound_and_does_not_end_screen(self):
+        state = bridge.Session(self.controller, self.clock)
+        identity, owner, other = (str(uuid.uuid4()) for _ in range(3))
+        state.session(dict(v=1, session_id=identity, state='start', capture_protocol=bridge.CAPTURE_PROTOCOL), principal=owner)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(state.capture, .5, 250)
+            ticket = state.poll(identity, .2, principal=owner)
+            outcome = dict(request_id=ticket['request_id'], status='no_video_sample')
+            with self.assertRaises(bridge.Failure) as caught:
+                state.poll(identity, 0, principal=other, outcome=outcome)
+            self.assertEqual(caught.exception.status, 403)
+            state.poll(identity, 0, principal=owner, outcome=dict(outcome, request_id=str(uuid.uuid4())))
+            self.assertIsNotNone(state.pending)
+            self.assertIsNone(state.poll(identity, 0, principal=owner, outcome=outcome))
+            with self.assertRaises(bridge.Failure) as caught:
+                result.result(1)
+            self.assertEqual((caught.exception.code, caught.exception.status), ('capture_no_video_sample', 408))
+        self.assertTrue(state.active)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(state.capture, .5, 250)
+            ticket = state.poll(identity, .2, principal=owner, outcome=outcome)
+            self.assertNotEqual(ticket['request_id'], outcome['request_id'])
+            headers = dict(self.frame_headers(ticket['request_id']), session=identity,
+                           **{'capture-wait-ms': '250', 'encode-ms': '1', 'callback-age-ms': '1'})
+            self.assertFailure('invalid_frame_timings', state.accept_frame, dict(headers, **{'encode-ms': '5001'}), JPEG)
+            state.accept_frame(headers, JPEG, principal=owner)
+            self.assertEqual(result.result(1)['jpeg'], JPEG)
+        self.assertTrue(state.active)
+        self.assertEqual(self.controller.calls, [])
+
     def test_status_tracks_only_bounded_heartbeat_age_and_explicit_inactive_reason(self):
         fresh = bridge.Session(Controller(), self.clock)
         self.assertEqual({k: fresh.status()[k] for k in
@@ -531,6 +620,55 @@ class TLSChecks(unittest.TestCase):
             self.assertNotIn(self.config['uploadToken'].encode(), caught.exception.read())
         with self.request('/v1/connection') as response:
             self.assertEqual(json.loads(response.read())['capture'], 'on-demand')
+
+    def test_real_tls_settle_metrics_and_no_video_outcome_preserve_old_phone_contract(self):
+        configured = dict(self.config, port=self.server.server_address[1], baseURL='https://' + self.authority)
+        (self.directory / 'bridge.json').write_text(json.dumps(configured))
+        client = mcp.Client(self.directory)
+        start = dict(v=1, session_id=self.identity, state='start')
+        with self.request('/v1/session', value=start): pass
+        with self.assertRaisesRegex(mcp.SafeFailure, '^phone_settle_unsupported$'):
+            client.request('POST', '/v1/screen', {'settle_ms': 250}, image=True)
+        self.assertIsNone(self.state.pending)
+        with self.request('/v1/session', value=dict(start, state='end')): pass
+        self.identity = str(uuid.uuid4())
+        with self.request('/v1/session', value=dict(start, session_id=self.identity, capture_protocol=bridge.CAPTURE_PROTOCOL)): pass
+        for body in ({'settle_ms': True}, {'settle_ms': 1001}, {'settle_ms': 0, 'url': 'private'}):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                self.request('/v1/screen', role='agent', value=body)
+            self.assertEqual(caught.exception.code, 400)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(client.request, 'POST', '/v1/screen', {'settle_ms': 250}, True)
+            with self.request('/v1/capture-request?session_id=' + self.identity) as response:
+                ticket = json.loads(response.read())
+            self.assertEqual(ticket['settle_ms'], 250)
+            headers = {'X-StreamShot-Session': self.identity, 'X-StreamShot-Request': ticket['request_id'],
+                       'X-StreamShot-Sequence': '1', 'X-StreamShot-Width': '2', 'X-StreamShot-Height': '3',
+                       'X-StreamShot-Orientation': '1', 'X-StreamShot-Geometry-Epoch': '1'}
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                self.request('/v1/frame', value=JPEG, extra=headers, image=True)
+            self.assertEqual(caught.exception.code, 400)
+            headers.update({'X-StreamShot-Capture-Wait-Ms': '250', 'X-StreamShot-Encode-Ms': '15',
+                            'X-StreamShot-Callback-Age-Ms': '80'})
+            with self.request('/v1/frame', value=JPEG, extra=headers, image=True): pass
+            metadata, data = result.result(3)
+            self.assertEqual(data, JPEG)
+            self.assertEqual(metadata['source_callback_age_ms'], 80)
+            self.assertEqual(metadata['capture_wait_ms'], 250)
+            self.assertGreaterEqual(metadata['observation_age_ms'], 79)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(client.request, 'POST', '/v1/screen', {'settle_ms': 250}, True)
+            with self.request('/v1/capture-request?session_id=' + self.identity) as response:
+                ticket = json.loads(response.read())
+            with self.request('/v1/capture-request?session_id=' + self.identity,
+                              extra={'X-StreamShot-Capture-Outcome': 'no_video_sample',
+                                     'X-StreamShot-Capture-Request-Id': ticket['request_id']}) as response:
+                self.assertEqual(response.status, 204)
+            with self.assertRaisesRegex(mcp.SafeFailure, '^screen_no_video_sample$'):
+                result.result(3)
+        self.assertTrue(self.state.active)
+        self.assertFalse(self.state.allow_control)
+        self.assertEqual(self.state.controller.calls, [])
 
     def test_actual_mcp_tls_screen_desktop_control_reset_and_new_lease(self):
         before = {p.name for p in self.directory.iterdir()}

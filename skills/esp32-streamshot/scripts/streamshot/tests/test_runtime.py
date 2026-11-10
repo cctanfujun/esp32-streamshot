@@ -24,6 +24,7 @@ CONFIG = {'version': 1, 'host': NETWORK['host'], 'originHost': NETWORK['originHo
 STATUS = {'v': 1, 'active': False, 'allow_control': False, 'session_id': None,
           'control_protocol': 'desktop-lease-v1',
           'sharing_protocol': bridge.SCREEN_RECOVERY_PROTOCOL,
+          'capture_protocol': bridge.CAPTURE_PROTOCOL,
           'has_observation': False, 'input_outcome_unknown': False,
           'pairing_available': True,
           'pairing_protocol': runtime.PAIRING_PROTOCOL,
@@ -191,6 +192,19 @@ class RuntimeTests(unittest.TestCase):
             request = Mock(return_value=old)
             runner = self.instance(request=request)
             with self.assertRaisesRegex(runtime.RuntimeFailure, '^runtime_sharing_upgrade_required$'):
+                runner.start()
+            self.assertFalse(runner.ready)
+            self.assertEqual(self.commands, [])
+            self.assertEqual(request.call_count, 1)
+
+    def test_pre_settle_listener_is_not_adopted_or_stopped(self):
+        for capability in (None, 'idle-cache-v1'):
+            old = dict(STATUS)
+            if capability is None: old.pop('capture_protocol')
+            else: old['capture_protocol'] = capability
+            request = Mock(return_value=old)
+            runner = self.instance(request=request)
+            with self.assertRaisesRegex(runtime.RuntimeFailure, '^runtime_capture_upgrade_required$'):
                 runner.start()
             self.assertFalse(runner.ready)
             self.assertEqual(self.commands, [])

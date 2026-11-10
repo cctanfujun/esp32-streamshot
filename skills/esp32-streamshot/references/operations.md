@@ -16,6 +16,8 @@ Key usages follow USB HID. Left Ctrl=1, Shift=2, Alt=4, GUI/Command=8. [Apple do
 
 Each primitive checks the same session, geometry and fresh observation. Unknown input stops the remainder; never automatically obtain a new frame and continue a partially executed macro. Capture failure after ACK is distinct from input failure. Replaying an RPC returns only its small input receipt, without image caching or further I/O.
 
+With a compatible `settle-ticket-v1` app, capture starts immediately after input ACK. The phone retains only the latest real callback within this request's short settle window, then encodes it, avoiding a desktop sleep that misses the animation's final frame. This is not idle caching. Source callback age is deducted from observation lifetime; a missing post-request sample is explicit. Old phones do not silently claim support for nonzero settle. The result's `input_ms`, `capture_ms`, and `total_ms` are measured host timings, not model reasoning time or proof of visual completion.
+
 ## Persistent-session fallback
 
 If native MCP tools are unavailable and a persistent Node REPL is available, use `scripts/session.mjs`. It starts one MCP child, frames JSON lines and preserves observation state without PTY echoes or polling sleeps. Do not start a one-shot MCP process per operation.

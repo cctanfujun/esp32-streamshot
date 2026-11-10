@@ -30,7 +30,7 @@ SAFE_CODES = frozenset(('runtime_network_unavailable', 'runtime_network_changed'
     'runtime_configuration_unavailable', 'runtime_already_running',
     'runtime_port_in_use', 'runtime_service_unavailable',
     'runtime_discovery_unavailable', 'runtime_discovery_upgrade_required',
-    'runtime_serial_configuration_conflict', 'runtime_sharing_upgrade_required'))
+    'runtime_serial_configuration_conflict', 'runtime_sharing_upgrade_required', 'runtime_capture_upgrade_required'))
 
 
 class RuntimeFailure(Exception):
@@ -168,6 +168,8 @@ def validate_status(value, serial_port=None, require_discovery=False):
         # An older listener cannot atomically bind resume_from or distinguish
         # a heartbeat interruption from an explicit screen revocation.
         raise RuntimeFailure('runtime_sharing_upgrade_required')
+    if value.get('capture_protocol') != bridge.CAPTURE_PROTOCOL:
+        raise RuntimeFailure('runtime_capture_upgrade_required')
     if value['active']:
         try: bridge.uid(value['session_id'])
         except bridge.Failure: raise RuntimeFailure('runtime_service_unavailable') from None

@@ -11,11 +11,12 @@ export class StreamShotSession {
     if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60000) throw new Error('invalid_timeout');
     const entry = fileURLToPath(new URL('./streamshot/streamshot_bridge.py', import.meta.url));
     const args = [entry, ...(state ? ['--state', state] : []), 'mcp'];
-    const env = { ...process.env };
-    // No inherited device selection: the caller must choose a port explicitly.
-    delete env.STREAMSHOT_SERIAL_PORT;
-    if (serialPort !== undefined) env.STREAMSHOT_SERIAL_PORT = serialPort;
-    const session = new StreamShotSession(spawn(python, args, { env, stdio: ['pipe', 'pipe', 'pipe'] }), timeoutMs);
+    if (serialPort !== undefined && (typeof serialPort !== 'string' ||
+        !/^\/dev\/cu\.(?:usbmodem|usbserial)[A-Za-z0-9_.-]*$/.test(serialPort))) throw new Error('invalid_serial_port');
+    // /usr/bin/env sets just this explicit selection. This also works in
+    // restricted Node REPLs without accessing a global process object.
+    const launch = [`STREAMSHOT_SERIAL_PORT=${serialPort ?? ''}`, python, ...args];
+    const session = new StreamShotSession(spawn('/usr/bin/env', launch, { stdio: ['pipe', 'pipe', 'pipe'] }), timeoutMs);
     try {
       await session.request('initialize', { protocolVersion: '2025-03-26', capabilities: {},
         clientInfo: { name: 'esp32-streamshot-skill', version: '0.1.0' } });
