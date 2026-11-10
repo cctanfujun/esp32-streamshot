@@ -1,0 +1,4 @@
+interface:
+  display_name: "ESP32 + StreamShot"
+  short_description: "Operate iPhone through StreamShot and ESP32 HID"
+  default_prompt: "Use $esp32-streamshot to operate my connected iPhone and verify each result."

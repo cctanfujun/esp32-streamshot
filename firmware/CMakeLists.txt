@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+set(IDF_TARGET "esp32s3" CACHE STRING "This firmware targets ESP32-S3 only")
+set(COMPONENTS main)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(streamshot_hid)

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+.local/
+build/
+sdkconfig
+sdkconfig.old
+*.pem
+bridge.json
+phone-connection.json
+phones.json
+runtime.json
+*.ipa
+*.xcresult/

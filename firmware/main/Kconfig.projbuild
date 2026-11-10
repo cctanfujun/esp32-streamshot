@@ -1,0 +1,10 @@
+menu "StreamShot serial input"
+choice STREAMSHOT_SERIAL_TRANSPORT
+    prompt "Command transport (never Wi-Fi)"
+    default STREAMSHOT_USB_SERIAL
+config STREAMSHOT_USB_SERIAL
+    bool "ESP32-S3 native USB Serial/JTAG"
+config STREAMSHOT_UART_SERIAL
+    bool "UART0 through the board's USB-UART bridge (115200 baud)"
+endchoice
+endmenu
