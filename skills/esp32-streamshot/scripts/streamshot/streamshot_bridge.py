@@ -345,8 +345,52 @@ class SerialController:
                     self.armed = self.current_session = None
 
     def reset(self, session):
-        # Only an explicit desktop reset may try the retired neutral stop again.
-        self.stop(session, retry=True)
+        # Only an explicit desktop reset can reopen the selected USB device.
+        # Re-enumeration can revoke an fd while retaining the same /dev name.
+        self.cancel(session)
+        with self.lock:
+            with self.state_lock:
+                if self.current_session is not None and self.current_session != session:
+                    raise Failure('controller_reset_required', 409)
+            replacement = None
+            try:
+                selected = os.stat(self.serial_port)
+                if not stat.S_ISCHR(selected.st_mode):
+                    raise OSError('selected serial device unavailable')
+                try:
+                    opened = os.fstat(self.fd)
+                    changed = ((selected.st_dev, selected.st_ino, selected.st_rdev)
+                               != (opened.st_dev, opened.st_ino, opened.st_rdev))
+                except OSError:
+                    changed = True
+                if changed:
+                    replacement = os.open(self.serial_port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+                    tty.setraw(replacement)
+                    options = termios.tcgetattr(replacement)
+                    options[4] = options[5] = termios.B115200
+                    termios.tcsetattr(replacement, termios.TCSANOW, options)
+                    with contextlib.suppress(OSError):
+                        os.close(self.fd)
+                    self.fd, replacement = replacement, None
+                    self.buffer = b''
+                try:
+                    self._command(session, str(uuid.uuid4()), 'status', {})
+                except Failure as error:
+                    # A valid status ACK has already recorded the new boot and
+                    # retired old sessions. Still require a confirmed stop.
+                    if error.code != 'controller_restarted_reset_required':
+                        raise
+                self.stop_attempted.add(session)
+                answer = self._command(session, str(uuid.uuid4()), 'stop', {})
+                if answer.get('armed') is not False:
+                    raise Failure('controller_not_ready', 503)
+                with self.state_lock:
+                    self.armed = self.current_session = None
+            except OSError:
+                raise Failure('controller_unavailable', 503) from None
+            finally:
+                if replacement is not None:
+                    os.close(replacement)
 
     def status(self):
         with self.state_lock:

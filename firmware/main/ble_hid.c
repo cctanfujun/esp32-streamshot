@@ -12,6 +12,10 @@ static esp_hidd_dev_t *device;
 static void (*notify_connection)(bool);
 static atomic_bool authenticated, hid_started;
 static atomic_uint adv_ready;
+static atomic_bool advertising;
+static atomic_int adv_result = -1, adv_event = -1, hid_status = -1;
+static atomic_int auth_failure, disconnect_reason;
+static atomic_uint connections, disconnections, authentications;
 
 // Report 1: relative mouse, three buttons, signed X/Y/wheel. Report 2:
 // boot-compatible keyboard packet plus LED output. IDs are not in packet data.
@@ -47,7 +51,7 @@ static void advertise(void)
         .own_addr_type = BLE_ADDR_TYPE_PUBLIC, .channel_map = ADV_CHNL_ALL,
         .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
     };
-    (void)esp_ble_gap_start_advertising(&parameters);
+    adv_result = esp_ble_gap_start_advertising(&parameters);
 }
 
 static void gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
@@ -58,9 +62,16 @@ static void gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
     } else if (event == ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT) {
         if (param->scan_rsp_data_cmpl.status == ESP_BT_STATUS_SUCCESS) adv_ready |= 2;
         advertise();
+    } else if (event == ESP_GAP_BLE_ADV_START_COMPLETE_EVT) {
+        adv_event = param->adv_start_cmpl.status;
+        advertising = adv_event == ESP_BT_STATUS_SUCCESS;
+    } else if (event == ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT) {
+        advertising = false;
     } else if (event == ESP_GAP_BLE_SEC_REQ_EVT) {
         (void)esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
     } else if (event == ESP_GAP_BLE_AUTH_CMPL_EVT) {
+        authentications++;
+        auth_failure = param->ble_security.auth_cmpl.success ? 0 : param->ble_security.auth_cmpl.fail_reason;
         authenticated = param->ble_security.auth_cmpl.success;
         notify_connection(authenticated);
         if (!authenticated) (void)esp_ble_gap_disconnect(param->ble_security.auth_cmpl.bd_addr);
@@ -75,9 +86,19 @@ static void hid_callback(void *context, esp_event_base_t base, int32_t event, vo
 {
     (void)context; (void)base;
     if (event == ESP_HIDD_START_EVENT) {
+        // ESP-IDF BLE posts START with a NULL payload (unlike Classic HID).
+        hid_status = ESP_OK;
         hid_started = true;
         advertise();
+    } else if (event == ESP_HIDD_CONNECT_EVENT) {
+        connections++;
+        advertising = false;
     } else if (event == ESP_HIDD_DISCONNECT_EVENT || event == ESP_HIDD_STOP_EVENT) {
+        if (event == ESP_HIDD_DISCONNECT_EVENT) {
+            const esp_hidd_event_data_t *value = data;
+            disconnections++;
+            disconnect_reason = value->disconnect.reason;
+        }
         authenticated = false;
         notify_connection(false);
         if (event == ESP_HIDD_DISCONNECT_EVENT) advertise();
@@ -85,6 +106,15 @@ static void hid_callback(void *context, esp_event_base_t base, int32_t event, vo
         const esp_hidd_event_data_t *value = data;
         notify_connection(value->control.control ? authenticated : false);
     }
+}
+
+ss_ble_diagnostics_t ss_ble_diagnostics(void)
+{
+    return (ss_ble_diagnostics_t){.hid_status = hid_status, .hid = hid_started,
+        .ready = adv_ready, .advertising = advertising, .adv_rc = adv_result,
+        .adv_event = adv_event, .connections = connections, .disconnections = disconnections,
+        .authentications = authentications, .fail = auth_failure, .reason = disconnect_reason,
+        .bonds = device ? esp_ble_get_bond_device_num() : -1};
 }
 
 esp_err_t ss_ble_init(void (*connection_changed)(bool))

@@ -16,6 +16,7 @@
 
 static ss_control_t control;
 static SemaphoreHandle_t mutex;
+static esp_err_t nvs_error, ble_error = ESP_ERR_INVALID_STATE;
 
 static uint64_t now_ms(void *context) { (void)context; return (uint64_t)esp_timer_get_time() / 1000; }
 static void sleep_ms(void *context, uint32_t ms) { (void)context; vTaskDelay(pdMS_TO_TICKS(ms)); }
@@ -89,7 +90,8 @@ void app_main(void)
     mutex = xSemaphoreCreateMutex();
     if (!mutex) return;
     // Never erase existing NVS or pairing data automatically on an init error.
-    if (nvs_flash_init() == ESP_OK) (void)ss_ble_init(connection);
+    nvs_error = nvs_flash_init();
+    if (nvs_error == ESP_OK) ble_error = ss_ble_init(connection);
     if (xTaskCreate(watchdog, "hid_watchdog", 3072, NULL, 5, NULL) != pdPASS) return;
     uint8_t input[128];
     ss_framer_t framer = {0};
@@ -101,8 +103,15 @@ void app_main(void)
                 xSemaphoreTake(mutex, portMAX_DELAY);
                 ss_ack_t ack = ss_execute(&control, &request);
                 xSemaphoreGive(mutex);
-                char output[384];
-                if (ss_ack_json(&ack, output, sizeof(output))) serial_write(output);
+                char output[SS_MAX_LINE];
+                bool encoded;
+                if (request.op == SS_STATUS) {
+                    ss_ble_diagnostics_t diagnostic = ss_ble_diagnostics();
+                    diagnostic.nvs = nvs_error;
+                    diagnostic.init = ble_error;
+                    encoded = ss_status_json(&ack, &diagnostic, output, sizeof(output));
+                } else encoded = ss_ack_json(&ack, output, sizeof(output));
+                if (encoded) serial_write(output);
             }
         }
     }

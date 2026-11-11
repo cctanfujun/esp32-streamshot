@@ -15,6 +15,18 @@ idf.py -C firmware -B .local/firmware-build build
 
 Verify that the active version is v5.5.1 before building. Generated `sdkconfig` and `.local` outputs are ignored. Build and inspect first; a build does not pair a phone or send input.
 
+The host-only safety checks require an explicit `IDF_PATH` pointing at that
+checkout, a C compiler and Git for verifying the SDK commit:
+
+```sh
+IDF_PATH=/path/to/esp-idf-v5.5.1 bash firmware/tools/test-host.sh
+```
+
+This runs the six control safety suites and numeric diagnostic serialization
+checks with AddressSanitizer and UndefinedBehaviorSanitizer. Output uses a
+private temporary directory that is removed on exit. It never opens a serial
+port or sends Bluetooth input; passing does not demonstrate phone connectivity.
+
 ## Flash and pair
 
 Flashing replaces firmware on the selected board. Preserve a full flash backup and confirm the exact S3/port before an explicitly authorized write. This skill never auto-flashes. After preparing that backup and selecting your board's **native USB** port:
@@ -34,3 +46,18 @@ If native USB remains in download mode, use the official tool's full watchdog re
 - Stop and reconnect neutralize when transport permits. A disconnected phone cannot receive a release; a board ACK is not visual confirmation.
 
 The integration requires its screen observation guard for AI input. Owner-observed hardware diagnosis is separate from automatic phone operation. No Wi-Fi credentials, model service, account access or screen capture exists in the firmware.
+
+## Read-only Bluetooth diagnostics
+
+The existing serial `status` reply also includes a versioned numeric `ble`
+object. It reports NVS and Bluetooth initialization results, HID readiness,
+advertising setup/start results, connection/authentication/disconnection
+counters, the last failure/disconnection reason and a bonded-device count.
+Sentinel values identify stages that have not run; an unset value is not a
+successful initialization. No peer addresses, keys, passkeys or input contents
+are included. The normal ACK fields and unarmed-by-default behavior remain.
+
+These fields help distinguish a running USB application from a working BLE
+connection. A successful serial reply or initialized Bluetooth stack does not
+guarantee that an iPhone is connected or that it received an input. Diagnostics
+do not arm control, delete bonds, erase NVS, pair a phone or retry HID input.

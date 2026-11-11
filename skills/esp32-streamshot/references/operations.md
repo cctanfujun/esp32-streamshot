@@ -33,3 +33,10 @@ Display returned image blocks directly in the client UI by emitting decoded byte
 If a mutating fallback call times out or loses transport, the helper immediately interrupts its own MCP child so the remaining batch cannot continue unseen. The last in-flight action remains unknown. Do not retry it or silently restart; reconnect, explicitly reset control, and inspect a new image before deciding what remains. This does not kill another client's bridge.
 
 After a capture timeout, check status once and distinguish sharing, reconnection and input state. Repeated broadcast restarts do not fix a missing frame. Record bounded diagnostics rather than looping on prompts or replaying input.
+
+An explicit desktop reset checks the selected USB device identity. If USB
+re-enumeration replaced it behind the same path, reset may reopen only that
+selected port, confirm the current boot and require an acknowledged neutral
+stop. A lost ACK, still-armed reply or reopen failure keeps input blocked. It
+preserves retired sessions, sequence numbers and replay protection; it does not
+re-pair Bluetooth or resume input without a fresh image and new action.

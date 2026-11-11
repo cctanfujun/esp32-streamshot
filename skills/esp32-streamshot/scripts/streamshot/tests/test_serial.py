@@ -361,7 +361,10 @@ class SerialChecks(unittest.TestCase):
         with self.assertRaises(bridge.Failure):
             state.action(dict(action, id=str(uuid.uuid4()), frame_id=state.frame['frame_id']))
         reset = dict(v=1, id=str(uuid.uuid4()), session_id=SESSION_A)
-        self.assertTrue(state.reset_control(reset)['ok'])
+        # The synthetic /dev/cu.* name exists only through constructor mocks;
+        # explicit reset now verifies its device identity again before I/O.
+        with patch.object(bridge.os, 'stat', return_value=os.fstat(peer.driver.fd)):
+            self.assertTrue(state.reset_control(reset)['ok'])
         self.assertTrue(state.active)
         self.assertFalse(state.allow_control)
         drop[0] = False
