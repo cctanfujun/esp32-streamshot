@@ -18,7 +18,7 @@ flowchart LR
 
 **Developer preview: macOS and a StreamShot build containing AI Link.** The public App Store 1.0 release does not include AI Link. Do not purchase that version for this integration. Compatible app distribution will be tracked here; no public AI Link app download is promised yet.
 
-A real iPhone has verified pointer movement, typing `test` into Notes, system Search, opening WeChat and switching to Chats. A 25-second local-server interruption recovered within the existing broadcast and returned a new picture. Complete messaging, arbitrary app control, long-running capture and all lock-screen scenarios are not fully validated. The skill reduces orchestration round trips; capture latency and smooth control remain active engineering work, with no unsupported speed claim.
+A real iPhone has verified pointer movement, typing `test` into Notes and on-demand pictures. Three short input-and-capture samples took 417–821 ms on one local network; this excludes model decisions and is not a whole-task speed claim. The current Notes-to-WeChat messaging attempt did not complete: system navigation was not configured, and sharing later timed out during setup. No message was sent. A previous 25-second local-server interruption recovered within its existing broadcast; that does not establish general recovery or long-running stability. Cross-app navigation, complete messaging and lock-screen scenarios remain under validation.
 
 ## Install the skill
 
