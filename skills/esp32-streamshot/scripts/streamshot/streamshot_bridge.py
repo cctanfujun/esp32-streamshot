@@ -32,7 +32,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-STATE = Path.home() / 'Library/Application Support/esp32-streamshot'
+STATE = Path.home() / 'Library/Application Support/start-1-dollar/streamshot-ai-link'
 MAX_IMAGE = 1024 * 1024
 MAX_JSON = 4096
 MAX_SEQUENCE = 2147483647
@@ -944,6 +944,9 @@ class Server(ThreadingHTTPServer):
 
     def get_request(self):
         connection, address = super().get_request()
+        # Replies send small headers and bodies separately. Do not delay the
+        # body behind a TCP acknowledgement during an interactive action.
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         connection.settimeout(15)
         return connection, address
 

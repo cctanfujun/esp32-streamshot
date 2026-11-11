@@ -15,10 +15,14 @@ Start with `streamshot_status`. If sharing is inactive, have the owner start the
 
 ## Operate with fewer round trips
 
+Establish a working Home/Search route during setup, before timing a task. AssistiveTouch's visible menu or an explicitly configured device button can provide Home. Do not assume Command-H or Command-Space works on an unverified generic BLE keyboard; use the observed device configuration.
+
 1. Get and inspect `streamshot_get_screen`. Keep its session_id and frame_id; observations expire after 30 seconds.
 2. Prefer `streamshot_act` for a short, predetermined action on the visible UI. It performs up to 16 primitive HID operations, then briefly waits and requests a new image in the same call. Read both acknowledgements and image.
 3. Batch typing into an identified field, or a bounded move/click at a known target. Stop at a UI decision: inspect the new page before typing or sending. Do not use a long macro based on guessed future screens.
 4. For a transition image, request one settled image. A serial ACK proves the board accepted input, not that the phone performed the intended action.
+
+Keep the normal loop to image → one UI decision → a short act returning its image. Reuse the same session; avoid status checks, environment discovery or shortcut research between successful steps. If setup is missing, record the attempt as incomplete and finish setup separately. Measure the complete task, including model decisions and failed waits, rather than reporting only `input_ms` or a fast sample.
 
 Example for an already focused search field:
 

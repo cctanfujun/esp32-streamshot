@@ -540,6 +540,27 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(self.tools.control_reset_required)
         self.assertIsNone(self.tools.observation)
 
+    def test_explicit_settled_screen_uses_real_ticket_without_input(self):
+        initialize(self.server)
+        result = tool(self.server, 'streamshot_get_screen', {'settle_ms': 750}, 210)['result']
+        self.assertFalse(result['isError'])
+        self.assertEqual(json.loads(result['content'][1]['text'])['capture_wait_ms'], 750)
+        self.assertEqual(self.client.calls, [('POST', '/v1/screen', {'settle_ms': 750}, True)])
+        self.assertEqual(self.tools.observed_at, 100)
+        self.clock.return_value = 131
+        failed = tool(self.server, 'streamshot_act', act(capture=False), 211)['result']
+        self.assertEqual(json.loads(failed['content'][0]['text'])['error'], 'observe_again')
+        self.assertEqual(len(self.client.calls), 1)
+
+    def test_settled_screen_rejects_invalid_arguments_before_io(self):
+        initialize(self.server)
+        for index, value in enumerate(({'settle_ms': True}, {'settle_ms': -1},
+                                       {'settle_ms': 1001}, {'settle_ms': 1.5},
+                                       {'settle_ms': 250, 'url': 'https://evil.invalid'})):
+            result = tool(self.server, 'streamshot_get_screen', value, 220 + index)
+            self.assertEqual(result['error']['code'], -32602)
+        self.assertEqual(self.client.calls, [])
+
     def test_stop_has_no_frame_requirement_and_old_session_cannot_resume(self):
         initialize(self.server)
         tool(self.server, 'streamshot_get_screen')
