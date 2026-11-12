@@ -31,3 +31,9 @@ flags=(-std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-fra
   "$project_dir/tests/test_diagnostics.c" "$work_dir/cJSON.o" \
   -lm -o "$work_dir/test_diagnostics"
 "$work_dir/test_diagnostics"
+"${CC:-cc}" "${flags[@]}" \
+  -I "$project_dir/core" -I "$sdk_dir/components/json/cJSON" \
+  "$project_dir/core/control.c" "$project_dir/core/runtime_gate.c" \
+  "$project_dir/tests/test_runtime_gate.c" "$work_dir/cJSON.o" \
+  -pthread -lm -o "$work_dir/test_runtime_gate"
+"$work_dir/test_runtime_gate"

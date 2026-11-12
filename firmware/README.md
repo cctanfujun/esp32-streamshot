@@ -61,3 +61,18 @@ These fields help distinguish a running USB application from a working BLE
 connection. A successful serial reply or initialized Bluetooth stack does not
 guarantee that an iPhone is connected or that it received an input. Diagnostics
 do not arm control, delete bonds, erase NVS, pair a phone or retry HID input.
+
+
+### Reconnection stability
+
+Bluetooth callbacks publish only an atomic connection generation/state. Control
+and neutral reports run on a separate task; disconnect, suspend or reconnect
+invalidates the old lease even if intermediate events coalesce. Every HID report
+checks that generation before and after the SDK call. A separate progress task
+restarts the chip after roughly three seconds of a blocked control loop, keeping
+NVS bonds and starting unarmed. It never replays input. An in-flight report cannot
+be withdrawn, and this is not a guarantee against every CPU or radio failure.
+
+Host checks cover concurrent callback publication, old-lease rejection, a link
+change inside an SDK send, startup, timestamp races and clock wrap. These software
+checks do not replace true-device reconnect and long-running stability tests.
