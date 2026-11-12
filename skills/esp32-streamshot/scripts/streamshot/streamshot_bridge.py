@@ -41,6 +41,8 @@ CAPTURE_PROTOCOL = 'settle-ticket-v1'
 MAX_SETTLE_MS = 1000
 FRAME_TIMINGS = {'capture-wait-ms': 'capture_wait_ms', 'encode-ms': 'encode_ms',
                  'callback-age-ms': 'source_callback_age_ms'}
+WINDOW_CALLBACK_HEADER = 'callback-offset-ms'
+WINDOW_INPUT_RELATIONS = frozenset(('before_last_input', 'during_last_input', 'after_last_ack', 'uncertain'))
 SCREEN_INACTIVE_REASONS = frozenset(('owner_pause', 'owner_end', 'agent_stop',
                                    'heartbeat_timeout', 'lease_expired', 'bridge_shutdown'))
 
@@ -150,6 +152,23 @@ def screen_arguments(value):
     if not isinstance(value, dict) or set(value) not in (set(), {'settle_ms'}):
         raise Failure('invalid_fields')
     return integer(value.get('settle_ms', 0), 0, MAX_SETTLE_MS)
+
+
+def window_arguments(value):
+    exact(value, {'session_id', 'frame_id', 'command_ids'})
+    uid(value['session_id'])
+    uid(value['frame_id'])
+    commands = value['command_ids']
+    if not isinstance(commands, list) or not 1 <= len(commands) <= 16:
+        raise Failure('invalid_fields')
+    if len({uid(command) for command in commands}) != len(commands):
+        raise Failure('invalid_fields')
+
+
+def finish_window_arguments(value):
+    exact(value, {'request_id', 'settle_ms'})
+    uid(value['request_id'])
+    return integer(value['settle_ms'], 0, MAX_SETTLE_MS)
 
 
 class UnavailableController:
@@ -426,6 +445,7 @@ class Session:
         self.result = None
         self.capture_busy = False
         self.phone_capture_protocol = None
+        self.phone_capture_window = False
         self.closed = set()
         self.commands = {}
         self.input_busy = False
@@ -466,6 +486,8 @@ class Session:
 
     def _expire(self):
         now = self.clock()
+        if self.pending and self.pending.get('commands') and self.pending['deadline'] <= now:
+            self._cancel_window()
         if self.active and (now - self.last_heartbeat > 20 or now - self.started > 1800):
             reason = 'lease_expired' if now - self.started > 1800 else 'heartbeat_timeout'
             old = self._deactivate(reason)
@@ -473,6 +495,12 @@ class Session:
                 threading.Thread(target=self.controller.stop, args=(old,), daemon=True).start()
         if self.frame and now - self.frame['received'] > 30:
             self.frame = None
+
+    def _cancel_window(self):
+        if 'last_input_at' in self.pending:
+            self.frame = None
+        self.pending = None
+        self.condition.notify_all()
 
     def _inactive_phone_failure(self, identity, principal):
         """Disclose a recovery disposition only to the old screen's owner."""
@@ -591,6 +619,7 @@ class Session:
                 self.identity, self.active = identity, True
                 self.owner = principal
                 self.phone_capture_protocol = capture_protocol
+                self.phone_capture_window = False
                 self.allow_control = False
                 self.control_identity = None
                 self.control_reset_required = False
@@ -630,7 +659,7 @@ class Session:
         if old:
             self.controller.stop(old)
 
-    def poll(self, identity, timeout=8, principal=None, outcome=None):
+    def poll(self, identity, timeout=8, principal=None, outcome=None, window=False, ready=None):
         uid(identity)
         if outcome is not None:
             exact(outcome, {'request_id', 'status'})
@@ -640,6 +669,21 @@ class Session:
         with self.condition:
             self._require(identity, principal)
             self.last_heartbeat = self.clock()
+            if window and self.phone_capture_protocol == CAPTURE_PROTOCOL:
+                self.phone_capture_window = True
+            if ready is not None:
+                uid(ready)
+                pending = self.pending
+                if not pending or pending['id'] != ready or not pending.get('commands') or 'offered_at' not in pending:
+                    return None
+                pending.setdefault('ready_at', self.clock())
+                self.condition.notify_all()
+                self.condition.wait_for(lambda: self.pending is not pending or 'settle_ms' in pending,
+                                        max(0, pending['deadline'] - self.clock()))
+                self._require(identity, principal)
+                if self.pending is not pending or 'settle_ms' not in pending:
+                    return None
+                return self._capture_ticket(identity, pending, 'finish')
             if (outcome is not None and self.pending is not None
                     and self.pending['id'] == outcome['request_id']):
                 self.result = {'capture_error': 'capture_' + outcome['status']}
@@ -650,16 +694,29 @@ class Session:
             self._require(identity, principal)
             self.last_heartbeat = self.clock()
             if self.pending and self.pending['deadline'] > self.clock():
-                ttl = min(5000, max(1, int((self.pending['deadline'] - self.clock()) * 1000)))
-                result = {'v': 1, 'session_id': identity, 'request_id': self.pending['id'], 'ttl_ms': ttl}
-                if self.phone_capture_protocol == CAPTURE_PROTOCOL:
-                    result['settle_ms'] = min(self.pending.get('settle_ms', 0), ttl)
-                return result
+                if self.pending.get('commands'):
+                    # A replacement poll cannot arm a different callback clock
+                    # against the same offer. The client can observe again.
+                    if not window or 'offered_at' in self.pending:
+                        return None
+                    self.pending['offered_at'] = self.clock()
+                    return self._capture_ticket(identity, self.pending, 'prepare')
+                return self._capture_ticket(identity, self.pending)
             return None
+
+    def _capture_ticket(self, identity, pending, phase=None):
+        ttl = min(5000, max(1, int((pending['deadline'] - self.clock()) * 1000)))
+        ticket = {'v': 1, 'session_id': identity, 'request_id': pending['id'], 'ttl_ms': ttl}
+        if self.phone_capture_protocol == CAPTURE_PROTOCOL:
+            ticket['settle_ms'] = min(pending.get('settle_ms', 0), ttl)
+        if phase is not None:
+            ticket['phase'] = phase
+        return ticket
 
     def accept_frame(self, values, data, principal=None):
         expected = {'session', 'request', 'sequence', 'width', 'height', 'orientation', 'geometry-epoch'}
-        if not isinstance(values, dict) or set(values) - expected - set(FRAME_TIMINGS) or not expected <= set(values):
+        if (not isinstance(values, dict) or set(values) - expected - set(FRAME_TIMINGS) - {WINDOW_CALLBACK_HEADER}
+                or not expected <= set(values)):
             raise Failure('invalid_fields')
         timings = {}
         for name, field in FRAME_TIMINGS.items():
@@ -694,6 +751,33 @@ class Session:
                 raise Failure('frame_not_requested_or_expired', 409)
             if self.geometry is not None and geometry != self.geometry:
                 raise Failure('geometry_changed_request_again', 409)
+            pending = self.pending
+            window = {}
+            if pending.get('commands'):
+                offset = values.get(WINDOW_CALLBACK_HEADER, '')
+                if 'settle_ms' not in pending or not isinstance(offset, str) or not re.fullmatch(r'[0-9]{1,4}', offset):
+                    raise Failure('invalid_frame_timings')
+                offset = integer(int(offset), 0, timings['capture_wait_ms'])
+                # The phone accepts the ticket between offer and ready receipt.
+                # Its measured offset bounds callback time on the host clock.
+                earliest = pending['offered_at'] + (offset - 2) / 1000
+                latest = min(self.clock() - max(0, timings['source_callback_age_ms'] - 2) / 1000,
+                             pending['ready_at'] + (offset + 3) / 1000)
+                if earliest > latest:
+                    raise Failure('invalid_frame_timings')
+                last_input, last_ack = pending['last_input_at'], pending.get('last_ack_at')
+                if latest < last_input:
+                    relation = 'before_last_input'
+                elif last_ack is not None and earliest >= last_ack:
+                    relation = 'after_last_ack'
+                elif last_ack is not None and earliest >= last_input and latest < last_ack:
+                    relation = 'during_last_input'
+                else:
+                    relation = 'uncertain'
+                window.update(source_callback_offset_ms=offset, input_relation=relation,
+                              usable_for_input=earliest >= last_input)
+            elif WINDOW_CALLBACK_HEADER in values:
+                raise Failure('invalid_frame_timings')
             self.geometry = geometry; self.sequence = sequence
             now = self.clock()
             observed = min(self.pending['created_at'], now - timings['source_callback_age_ms'] / 1000) if timings else now
@@ -701,7 +785,7 @@ class Session:
                           'sequence': sequence, 'width': geometry[1], 'height': geometry[2],
                           'orientation': geometry[3], 'geometry_epoch': geometry[0], 'received': observed,
                           'digest': digest, 'jpeg': data,
-                          'observation_epoch': self.pending['observation_epoch']}
+                          'observation_epoch': pending['observation_epoch'], **window}
             if timings:
                 self.frame.update(timings, observation_age_ms=min(5000, max(0, int((now - observed) * 1000))))
             self.result = self.frame; self.pending = None
@@ -714,7 +798,7 @@ class Session:
             self._require(self.identity)
             if settle_ms and self.phone_capture_protocol != CAPTURE_PROTOCOL:
                 raise Failure('phone_settle_unsupported', 409)
-            if self.capture_busy:
+            if self.capture_busy or self.pending is not None:
                 raise Failure('capture_busy', 409)
             self.capture_busy = True
             self.result = None
@@ -740,8 +824,73 @@ class Session:
                 self.capture_busy = False
                 self.pending = self.result = None
 
-    def action(self, value):
+    def prepare_window(self, value, timeout=1):
+        window_arguments(value)
+        with self.condition:
+            self._require(value['session_id'])
+            if not self.phone_capture_window:
+                return {'request_id': None}
+            if (self.frame is None or self.frame['frame_id'] != value['frame_id']
+                    or self.frame['observation_epoch'] != self.observation_epoch
+                    or not self.frame.get('usable_for_input', True) or self.control_reset_required or self.unknown):
+                raise Failure('observe_again', 409)
+            if self.pending is not None or self.capture_busy or self.input_busy or self.control_reset_busy:
+                raise Failure('capture_busy', 409)
+            if any(command in self.commands for command in value['command_ids']):
+                raise Failure('command_id_changed', 409)
+            now = self.clock()
+            pending = {'id': str(uuid.uuid4()), 'created_at': now, 'deadline': now + 5,
+                       'frame_id': value['frame_id'], 'commands': tuple(value['command_ids']), 'next_command': 0,
+                       'observation_epoch': self.observation_epoch}
+            self.pending = pending
+            self.result = None
+            self.condition.notify_all()
+            self.condition.wait_for(lambda: self.pending is not pending or 'ready_at' in pending, timeout)
+            if (self.pending is pending and 'ready_at' in pending
+                    and pending['observation_epoch'] == self.observation_epoch):
+                return {'request_id': pending['id']}
+            if self.pending is pending:
+                self.pending = None
+                self.condition.notify_all()
+            raise Failure('capture_window_not_ready', 408)
+
+    def finish_window(self, value):
+        settle = finish_window_arguments(value)
+        with self.condition:
+            self._require(self.identity)
+            pending = self.pending
+            if (self.capture_busy or self.input_busy or not pending or pending['id'] != value['request_id']
+                    or 'ready_at' not in pending or 'settle_ms' in pending):
+                raise Failure('capture_window_unavailable', 409)
+            if 'last_input_at' not in pending:
+                self._cancel_window()
+                raise Failure('capture_window_unavailable', 409)
+            self.frame = None
+            self.capture_busy = True
+            pending['settle_ms'] = settle
+            self.condition.notify_all()
+            try:
+                self.condition.wait_for(lambda: self.pending is not pending,
+                                        max(0, pending['deadline'] - self.clock()) + 0.1)
+                result = self.result
+                if result is None:
+                    raise Failure('capture_not_received', 408)
+                if 'capture_error' in result:
+                    raise Failure(result['capture_error'], 408)
+                if result['usable_for_input']:
+                    self.unknown = False
+                return result
+            finally:
+                self.capture_busy = False
+                if self.pending is pending:
+                    self.pending = None
+                self.result = None
+                self.condition.notify_all()
+
+    def action(self, value, window_id=None):
         operation, arguments = action_arguments(value)
+        if window_id is not None:
+            uid(window_id)
         digest = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
         with self.condition:
             old = self.commands.get(value['id'])
@@ -751,10 +900,14 @@ class Session:
                 return old['result']
             if operation != 'release_all':
                 self._require(value['session_id'])
+                if window_id is not None and (self.pending is None or self.pending['id'] != window_id
+                                              or not self.pending.get('commands')):
+                    raise Failure('capture_window_unavailable', 409)
                 if self.control_reset_required:
                     raise Failure('control_reset_required', 409)
                 if (self.frame is None or self.frame['frame_id'] != value['frame_id']
-                        or self.frame.get('observation_epoch') != self.observation_epoch):
+                        or self.frame.get('observation_epoch') != self.observation_epoch
+                        or not self.frame.get('usable_for_input', True)):
                     raise Failure('observe_again', 409)
                 if self.unknown:
                     raise Failure('previous_input_unknown_observe_again', 409)
@@ -762,6 +915,20 @@ class Session:
                 raise Failure('input_in_progress', 409)
             if len(self.commands) >= 4096:
                 raise Failure('command_limit_restart_bridge', 409)
+            pending = self.pending
+            window = pending if pending and pending.get('commands') else None
+            if window is not None:
+                if operation == 'release_all':
+                    self._cancel_window()
+                    window = None
+                else:
+                    index = window['next_command']
+                    if (window_id is None or 'ready_at' not in window or 'settle_ms' in window or index >= len(window['commands'])
+                            or value['id'] != window['commands'][index] or value['frame_id'] != window['frame_id']):
+                        raise Failure('capture_busy', 409)
+                    window['next_command'] += 1
+                    window['last_input_at'] = self.clock()
+                    window.pop('last_ack_at', None)
             # Neutral release does not create or restore a control lease.
             if operation != 'release_all' and self.control_identity is None:
                 self.control_identity = str(uuid.uuid4())
@@ -807,6 +974,8 @@ class Session:
             with self.condition:
                 self.input_busy = False
                 record['result'] = result
+                if window is not None and self.pending is window and result['ok']:
+                    window['last_ack_at'] = self.clock()
         return result
 
     def reset_control(self, value):
@@ -836,6 +1005,9 @@ class Session:
             old = self._detach_control() or self.retired_control_identity
             generation = self.control_generation
             self.frame = self.result = None
+            if self.pending and self.pending.get('commands'):
+                self.pending = None
+                self.condition.notify_all()
         succeeded = False
         try:
             if old:
@@ -986,7 +1158,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         if isinstance(value, dict):
             disposition = {'phone_settle_unsupported': 'phone_settle_unsupported',
-                           'capture_no_video_sample': 'no_video_sample', 'capture_ticket_expired': 'ticket_expired'}.get(value.get('error'))
+                           'capture_no_video_sample': 'no_video_sample', 'capture_ticket_expired': 'ticket_expired',
+                           'capture_window_not_ready': 'window_not_ready',
+                           'capture_window_unavailable': 'window_unavailable'}.get(value.get('error'))
             if disposition is not None:
                 self.send_header('X-StreamShot-Capture-Error', disposition)
         if metadata:
@@ -995,6 +1169,10 @@ class Handler(BaseHTTPRequestHandler):
             for key in (*FRAME_TIMINGS.values(), 'observation_age_ms'):
                 if key in metadata:
                     self.send_header('X-StreamShot-' + key.replace('_', '-'), str(metadata[key]))
+            if 'input_relation' in metadata:
+                self.send_header('X-StreamShot-Source-Callback-Offset-Ms', str(metadata['source_callback_offset_ms']))
+                self.send_header('X-StreamShot-Input-Relation', metadata['input_relation'])
+                self.send_header('X-StreamShot-Usable-For-Input', '1' if metadata['usable_for_input'] else '0')
         self.end_headers()
         if data:
             self.wfile.write(data)
@@ -1045,7 +1223,12 @@ class Handler(BaseHTTPRequestHandler):
                 if any(len(self.headers.get_all(name, [])) != 1 for name in fields):
                     raise Failure('invalid_capture_outcome')
                 outcome = {'status': self.headers[fields[0]], 'request_id': self.headers[fields[1]]}
-            value = self.server.session.poll(query['session_id'][0], principal=principal, outcome=outcome)
+            windows = self.headers.get_all('X-StreamShot-Capture-Window', [])
+            ready = self.headers.get_all('X-StreamShot-Window-Ready', [])
+            if windows not in ([], ['1']) or len(ready) > 1 or ready and (outcome or not windows):
+                raise Failure('invalid_capture_outcome')
+            value = self.server.session.poll(query['session_id'][0], principal=principal, outcome=outcome,
+                                             window=bool(windows), ready=ready[0] if ready else None)
             return self._reply(200 if value else 204, value)
         if parsed.query:
             raise Failure('query_not_allowed')
@@ -1058,7 +1241,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == 'POST' and path == '/v1/frame':
             headers = {key: self.headers.get('X-StreamShot-' + key) for key in
                        ('session', 'request', 'sequence', 'width', 'height', 'orientation', 'geometry-epoch')}
-            for key in FRAME_TIMINGS:
+            for key in (*FRAME_TIMINGS, WINDOW_CALLBACK_HEADER):
                 name = 'X-StreamShot-' + key
                 if self.headers.get(name) is not None:
                     if len(self.headers.get_all(name, [])) != 1:
@@ -1070,8 +1253,16 @@ class Handler(BaseHTTPRequestHandler):
             settle = screen_arguments(self._body())
             value = self.server.session.capture(settle_ms=settle)
             return self._reply(200, image=value['jpeg'], metadata=value)
+        if self.command == 'POST' and path == '/v1/screen/prepare':
+            return self._reply(200, self.server.session.prepare_window(self._body()))
+        if self.command == 'POST' and path == '/v1/screen/finish':
+            value = self.server.session.finish_window(self._body())
+            return self._reply(200, image=value['jpeg'], metadata=value)
         if self.command == 'POST' and path == '/v1/actions':
-            return self._reply(200, self.server.session.action(self._body()))
+            windows = self.headers.get_all('X-StreamShot-Action-Window', [])
+            if len(windows) > 1:
+                raise Failure('invalid_fields')
+            return self._reply(200, self.server.session.action(self._body(), windows[0] if windows else None))
         if self.command == 'POST' and path == '/v1/control/reset':
             return self._reply(200, self.server.session.reset_control(self._body()))
         if self.command == 'POST' and path == '/v1/stop':

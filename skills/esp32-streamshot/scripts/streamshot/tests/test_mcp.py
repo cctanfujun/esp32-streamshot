@@ -1,5 +1,6 @@
 """MCP tests with mock HTTPS, synthetic JPEG markers and real loopback TLS."""
 import base64
+import http.client
 import copy
 from email.message import Message
 import io
@@ -35,6 +36,10 @@ class FakeClient:
         self.action_error = 'PRIVATE_SERVER_ERROR'
         self.active = True
         self.next_frame = FRAME
+
+    def prepare_window(self, value):
+        mcp.bridge.window_arguments(value)
+        return None
 
     def request(self, method, path, value=None, image=False):
         self.calls.append((method, path, copy.deepcopy(value), image))
@@ -491,7 +496,7 @@ class ProtocolTests(unittest.TestCase):
     def test_act_requests_ticket_immediately_and_reports_measured_bounded_times(self):
         initialize(self.server)
         tool(self.server, 'streamshot_get_screen', identity=190)
-        self.tools.timer = Mock(side_effect=[1, 2, 2, 4, 5])
+        self.tools.timer = Mock(side_effect=[1, 1, 2, 2, 4, 5])
         result = tool(self.server, 'streamshot_act', act(settle_ms=500), 191)['result']
         summary = json.loads(result['content'][0]['text'])
         self.assertEqual({key: summary[key] for key in ('input_ms', 'capture_ms', 'total_ms')},
@@ -943,6 +948,89 @@ class StableOriginTLSTests(unittest.TestCase):
                 replay = tool(server, 'streamshot_act', args, 201)['result']
                 self.assertEqual(len(self.sni), before)
                 self.assertEqual(len(replay['content']), 1)
+
+    def test_action_window_preserves_callback_from_before_ack_over_real_tls(self):
+        clock = Mock(return_value=10.0)
+        controller = Mock()
+        self.session = mcp.bridge.Session(controller, clock=clock)
+        self.server.session = self.session
+        self.session.session(dict(v=1, session_id=SESSION, state='start',
+                                  capture_protocol=mcp.bridge.CAPTURE_PROTOCOL), principal='legacy')
+        server = mcp.MCP(mcp.Tools(self.directory))
+        initialize(server)
+        context = ssl.create_default_context(cafile=str(self.directory / 'certificate.pem'))
+        phone = http.client.HTTPSConnection('127.0.0.1', self.config['port'], context=context, timeout=5)
+        self.addCleanup(phone.close)
+        phone_headers = {'Host': self.authority, 'Authorization': 'Bearer ' + self.config['uploadToken']}
+        errors = []
+
+        def request_phone(method, path, headers, data=None):
+            phone.request(method, path, data, {**phone_headers, **headers})
+            response = phone.getresponse()
+            return response.status, response.read()
+
+        def poll(extra=None):
+            status, data = request_phone('GET', '/v1/capture-request?session_id=' + SESSION,
+                                         {'X-StreamShot-Capture-Window': '1', **(extra or {})})
+            self.assertEqual(status, 200)
+            return json.loads(data)
+
+        def upload(ticket, sequence, offset=None):
+            headers = {'Content-Type': 'image/jpeg', 'X-StreamShot-Session': SESSION,
+                       'X-StreamShot-Request': ticket['request_id'], 'X-StreamShot-Sequence': str(sequence),
+                       'X-StreamShot-Width': '2', 'X-StreamShot-Height': '3',
+                       'X-StreamShot-Orientation': '1', 'X-StreamShot-Geometry-Epoch': '1',
+                       'X-StreamShot-Capture-Wait-Ms': '150', 'X-StreamShot-Encode-Ms': '2',
+                       'X-StreamShot-Callback-Age-Ms': '52'}
+            if offset is not None:
+                headers['X-StreamShot-Callback-Offset-Ms'] = str(offset)
+            self.assertEqual(request_phone('POST', '/v1/frame', headers, JPEG)[0], 201)
+
+        def phone_run():
+            try:
+                upload(poll(), 1)
+                ticket = poll()
+                self.assertEqual(ticket['phase'], 'prepare')
+                self.assertEqual(controller.perform.call_count, 0)
+                clock.return_value = 11.01
+                finished = poll({'X-StreamShot-Window-Ready': ticket['request_id']})
+                self.assertEqual(finished['phase'], 'finish')
+                self.assertEqual(finished['request_id'], ticket['request_id'])
+                self.assertEqual(controller.perform.call_count, 1)
+                clock.return_value = 11.17
+                upload(ticket, 2, offset=100)
+            except Exception as error:
+                errors.append(error)
+
+        def perform(*args):
+            # The only synthetic callback was at phone offset 100ms, inside
+            # the host input interval [11.01, 11.12] and before finish.
+            clock.return_value = 11.12
+
+        controller.perform.side_effect = perform
+        worker = threading.Thread(target=phone_run, daemon=True)
+        worker.start()
+        screen = tool(server, 'streamshot_get_screen', identity=210)['result']
+        self.assertFalse(screen['isError'])
+        clock.return_value = 11.0
+        frame = json.loads(screen['content'][1]['text'])
+        args = act(frame_id=frame['frame_id'], settle_ms=0)
+        result = tool(server, 'streamshot_act', args, 211)['result']
+        worker.join(6)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertFalse(result['isError'], result['content'][0]['text'])
+        receipt = json.loads(result['content'][0]['text'])
+        self.assertEqual(receipt['acknowledged'], 1)
+        self.assertEqual(receipt['screen_status'], 'captured')
+        self.assertEqual(receipt['screen']['input_relation'], 'during_last_input')
+        self.assertEqual(receipt['screen']['source_callback_offset_ms'], 100)
+        self.assertTrue(receipt['screen']['usable_for_input'])
+        self.assertEqual(base64.b64decode(result['content'][1]['data']), JPEG)
+        self.assertIsNone(self.session.pending)
+        replay = tool(server, 'streamshot_act', args, 211)['result']
+        self.assertEqual(len(replay['content']), 1)
+        self.assertEqual(controller.perform.call_count, 1)
 
 
 if __name__ == '__main__':

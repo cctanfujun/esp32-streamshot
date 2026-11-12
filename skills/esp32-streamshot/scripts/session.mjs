@@ -23,7 +23,7 @@ function view(result) {
     ? { ...metadata } : null;
   const summary = {};
   for (const key of ['ok', 'status', 'error', 'requested', 'acknowledged', 'retryInput',
-    'input_ms', 'capture_ms', 'total_ms', 'screen_status', 'screen_error']) {
+    'input_ms', 'capture_prepare_ms', 'capture_ms', 'total_ms', 'screen_status', 'screen_error']) {
     if (data?.[key] !== undefined) summary[key] = data[key];
   }
   if (Array.isArray(data?.results)) {
@@ -136,8 +136,11 @@ export class StreamShotSession {
 
   trace(name, timing, data) {
     const entry = { tool: name, ...timing };
-    for (const key of ['input_ms', 'capture_ms', 'total_ms', 'acknowledged', 'requested', 'screen_status']) {
+    for (const key of ['input_ms', 'capture_prepare_ms', 'capture_ms', 'total_ms', 'acknowledged', 'requested', 'screen_status']) {
       if (data?.[key] !== undefined) entry[key] = data[key];
+    }
+    for (const key of ['source_callback_offset_ms', 'input_relation']) {
+      if (data?.screen?.[key] !== undefined) entry[key] = data.screen[key];
     }
     if (this.benchmark) {
       if (this.benchmark.calls.length < 512) this.benchmark.calls.push(entry);

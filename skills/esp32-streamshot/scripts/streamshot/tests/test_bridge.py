@@ -80,6 +80,52 @@ class StateChecks(unittest.TestCase):
                            self.frame_headers(str(uuid.uuid4())), JPEG)
         self.assertEqual(self.controller.calls, [])
 
+    def test_prepared_action_stays_bound_to_its_window_and_rejects_old_callback_for_input(self):
+        state = bridge.Session(self.controller, self.clock)
+        state.session(dict(v=1, session_id=self.session, state='start', capture_protocol=bridge.CAPTURE_PROTOCOL))
+        timings = {'capture-wait-ms': '100', 'encode-ms': '1', 'callback-age-ms': '100'}
+        with concurrent.futures.ThreadPoolExecutor(3) as pool:
+            original = pool.submit(state.capture, .5)
+            ticket = state.poll(self.session, .2, window=True)
+            state.accept_frame(dict(self.frame_headers(ticket['request_id']), **timings), JPEG)
+            action = self.action(original.result(1), button='left')
+            payload = dict(session_id=self.session, frame_id=action['frame_id'], command_ids=[action['id']])
+            prepared = pool.submit(state.prepare_window, payload)
+            window = state.poll(self.session, .2, window=True)
+            self.assertFailure('capture_busy', state.action, action, window['request_id'])
+            self.assertEqual(self.controller.calls, [])
+            ready = pool.submit(state.poll, self.session, window=True, ready=window['request_id'])
+            self.assertEqual(prepared.result(1), {'request_id': window['request_id']})
+            self.clock.now = .2
+            self.assertFailure('capture_busy', state.action, action)
+            self.assertTrue(state.action(action, window['request_id'])['ok'])
+            finishing = pool.submit(state.finish_window, dict(request_id=window['request_id'], settle_ms=0))
+            self.assertEqual(ready.result(1)['phase'], 'finish')
+            state.accept_frame(dict(self.frame_headers(window['request_id'], sequence=2),
+                                    **timings, **{'callback-offset-ms': '10'}), JPEG)
+            diagnostic = finishing.result(1)
+        self.assertEqual(diagnostic['input_relation'], 'before_last_input')
+        self.assertFalse(diagnostic['usable_for_input'])
+        followup = self.action(diagnostic, button='left')
+        self.assertFailure('observe_again', state.action, followup)
+        self.assertFailure('capture_window_unavailable', state.action, followup, window['request_id'])
+        self.assertEqual(len(self.controller.calls), 1)
+
+    def test_window_prepare_timeout_releases_slot_without_sending_input(self):
+        state = bridge.Session(self.controller, self.clock)
+        state.session(dict(v=1, session_id=self.session, state='start', capture_protocol=bridge.CAPTURE_PROTOCOL))
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(state.capture, .5)
+            ticket = state.poll(self.session, .2, window=True)
+            state.accept_frame(dict(self.frame_headers(ticket['request_id']),
+                               **{'capture-wait-ms': '0', 'encode-ms': '0', 'callback-age-ms': '0'}), JPEG)
+            frame = result.result(1)
+        action = self.action(frame, button='left')
+        payload = dict(session_id=self.session, frame_id=frame['frame_id'], command_ids=[action['id']])
+        self.assertFailure('capture_window_not_ready', state.prepare_window, payload, 0)
+        self.assertIsNone(state.pending)
+        self.assertEqual(self.controller.calls, [])
+
     def test_settle_ticket_is_explicit_and_window_metrics_do_not_renew_observation_age(self):
         state = bridge.Session(self.controller, self.clock)
         identity = str(uuid.uuid4())
