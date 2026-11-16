@@ -236,6 +236,66 @@ class StateChecks(unittest.TestCase):
         self.assertTrue(state.active)
         self.assertEqual(self.controller.calls, [])
 
+    def quiet_capture(self, *, cached_on_silence=True, outcome='no_video_sample'):
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(self.state.capture, .5, 0, cached_on_silence)
+            request = self.state.poll(self.session, .2)
+            self.assertIsNotNone(request)
+            self.state.poll(self.session, 0, outcome=dict(request_id=request['request_id'], status=outcome))
+            return result.result(1)
+
+    def test_cached_preview_reuses_exact_pixels_and_age_but_never_authorizes_input(self):
+        original = self.capture()
+        self.clock.now = 1.125
+        self.assertFailure('capture_no_video_sample', lambda: self.quiet_capture(cached_on_silence=False))
+        self.assertFailure('capture_ticket_expired', lambda: self.quiet_capture(outcome='ticket_expired'))
+        preview = self.quiet_capture()
+        self.assertEqual(preview['capture_origin'], 'cached')
+        self.assertEqual(preview['frame_id'], original['frame_id'])
+        self.assertEqual(preview['session_id'], original['session_id'])
+        self.assertEqual(preview['jpeg'], JPEG)
+        self.assertEqual(preview['cached_age_ms'], 1125)
+        self.assertIs(preview['usable_for_control'], False)
+        self.assertEqual(self.state.frame['received'], original['received'])
+        self.assertFailure('observe_again', self.state.action, self.action(preview, button='left'))
+        self.assertFalse(self.state.allow_control)
+        self.assertEqual(self.controller.calls, [])
+        self.clock.now = 2
+        self.assertEqual(self.quiet_capture()['cached_age_ms'], 2000)
+        next_frame = self.capture(sequence=2)
+        self.assertNotEqual(next_frame['frame_id'], original['frame_id'])
+        self.assertTrue(self.state.action(self.action(next_frame, button='left'))['ok'])
+        self.assertFailure('capture_no_video_sample', self.quiet_capture)
+
+    def test_cached_preview_requires_explicit_silence_and_living_geometry_and_session(self):
+        self.assertFailure('capture_no_video_sample', self.quiet_capture)
+        self.capture()
+        self.assertFailure('capture_not_received', self.state.capture, 0, 0, True)
+        self.clock.now = 15
+        self.state.poll(self.session, 0)  # keep the original session alive
+        self.clock.now = 30.001
+        self.assertFailure('capture_no_video_sample', self.quiet_capture)
+        self.capture(sequence=2)
+        self.state.session({'v': 1, 'session_id': self.session, 'state': 'geometry', 'geometry_epoch': 2,
+                           'width': 2, 'height': 3, 'orientation': 1})
+        self.assertFailure('capture_no_video_sample', self.quiet_capture)
+        self.capture(sequence=3, epoch=2)
+        self.state.session({'v': 1, 'session_id': self.session, 'state': 'pause'})
+        self.assertFailure('session_inactive', self.state.capture, .5, 0, True)
+        self.session = str(uuid.uuid4())
+        self.start()
+        self.assertFailure('capture_no_video_sample', self.quiet_capture)
+
+    def test_intervening_input_disqualifies_an_in_flight_ordinary_ticket_as_preview(self):
+        original = self.capture()
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(self.state.capture, .5)
+            ticket = self.state.poll(self.session, .2)
+            self.assertTrue(self.state.action(self.action(original, button='left'))['ok'])
+            self.state.accept_frame(self.frame_headers(ticket['request_id'], sequence=2), JPEG)
+            result.result(1)
+        self.assertFailure('capture_no_video_sample', self.quiet_capture)
+
     def test_status_tracks_only_bounded_heartbeat_age_and_explicit_inactive_reason(self):
         fresh = bridge.Session(Controller(), self.clock)
         self.assertEqual({k: fresh.status()[k] for k in
@@ -700,7 +760,8 @@ class TLSChecks(unittest.TestCase):
         with self.request('/v1/session', value=dict(start, state='end')): pass
         self.identity = str(uuid.uuid4())
         with self.request('/v1/session', value=dict(start, session_id=self.identity, capture_protocol=bridge.CAPTURE_PROTOCOL)): pass
-        for body in ({'settle_ms': True}, {'settle_ms': 1001}, {'settle_ms': 0, 'url': 'private'}):
+        for body in ({'settle_ms': True}, {'settle_ms': 1001}, {'settle_ms': 0, 'url': 'private'},
+                     {'cached_on_silence': 1}):
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 self.request('/v1/screen', role='agent', value=body)
             self.assertEqual(caught.exception.code, 400)
@@ -733,6 +794,27 @@ class TLSChecks(unittest.TestCase):
                 self.assertEqual(response.status, 204)
             with self.assertRaisesRegex(mcp.SafeFailure, '^screen_no_video_sample$'):
                 result.result(3)
+        tools = mcp.Tools(self.directory)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            result = pool.submit(tools.call, 'streamshot_get_screen', {'cached_on_silence': True})
+            with self.request('/v1/capture-request?session_id=' + self.identity) as response:
+                ticket = json.loads(response.read())
+            with self.request('/v1/capture-request?session_id=' + self.identity,
+                              extra={'X-StreamShot-Capture-Outcome': 'no_video_sample',
+                                     'X-StreamShot-Capture-Request-Id': ticket['request_id']}) as response:
+                self.assertEqual(response.status, 204)
+            preview = result.result(3)
+        snapshot = json.loads(preview['content'][1]['text'])
+        self.assertFalse(preview['isError'])
+        self.assertEqual(base64.b64decode(preview['content'][0]['data']), JPEG)
+        self.assertEqual(snapshot['frame_id'], metadata['frame_id'])
+        self.assertEqual(snapshot['capture_origin'], 'cached')
+        self.assertGreaterEqual(snapshot['cached_age_ms'], metadata['observation_age_ms'])
+        self.assertIs(snapshot['usable_for_control'], False)
+        self.assertIsNone(tools.observation)
+        with self.assertRaisesRegex(mcp.InputNotSent, '^observe_again$'):
+            client.request('POST', '/v1/actions', dict(v=1, id=str(uuid.uuid4()), session_id=self.identity,
+                           frame_id=snapshot['frame_id'], op='click', button='left'))
         self.assertTrue(self.state.active)
         self.assertFalse(self.state.allow_control)
         self.assertEqual(self.state.controller.calls, [])

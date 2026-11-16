@@ -914,6 +914,27 @@ class TransportTests(unittest.TestCase):
         with self.assertRaisesRegex(mcp.SafeFailure, '^invalid_frame_metadata$'):
             mcp.header_metadata(partial, JPEG)
 
+    def test_cached_frame_headers_require_read_only_provenance_and_cannot_be_mixed(self):
+        headers = {'X-StreamShot-' + key.replace('_', '-'): str(value) for key, value in METADATA.items()}
+        cached = {'X-StreamShot-Capture-Origin': 'cached', 'X-StreamShot-Cached-Age-Ms': '30000',
+                  'X-StreamShot-Usable-For-Control': '0'}
+        parsed = mcp.header_metadata(dict(headers, **cached), JPEG)
+        self.assertEqual(parsed, dict(METADATA, capture_origin='cached', cached_age_ms=30000, usable_for_control=False))
+        for bogus in ({'X-StreamShot-Usable-For-Control': '1'}, {'X-StreamShot-Cached-Age-Ms': '30001'},
+                      {'X-StreamShot-Capture-Origin': 'fresh'}, {'X-StreamShot-Usable-For-Input': '1'},
+                      {'X-StreamShot-Observation-Age-Ms': '2'}):
+            with self.assertRaisesRegex(mcp.SafeFailure, '^invalid_frame_metadata$'):
+                mcp.header_metadata(dict(headers, **dict(cached, **bogus)), JPEG)
+        with self.assertRaisesRegex(mcp.SafeFailure, '^invalid_frame_metadata$'):
+            mcp.header_metadata(dict(headers, **{'X-StreamShot-Capture-Origin': 'cached'}), JPEG)
+
+    def test_old_runtime_rejects_cached_boolean_without_retrying(self):
+        error = urllib.error.HTTPError('https://synthetic.invalid', 400, 'invalid_fields', {}, Mock())
+        client = self.client(error=error)
+        with self.assertRaisesRegex(mcp.SafeFailure, '^runtime_capture_upgrade_required$'):
+            client.request('POST', '/v1/screen', {'cached_on_silence': True}, image=True)
+        self.assertEqual(client.opener.open.call_count, 1)
+
     def test_http_errors_do_not_read_body_or_retry(self):
         body = Mock()
         error = urllib.error.HTTPError('https://synthetic.invalid', 401, 'PRIVATE_HTTP_BODY', {}, body)
@@ -1115,13 +1136,22 @@ class StableOriginTLSTests(unittest.TestCase):
                 self.assertEqual(len(replay['content']), 1)
 
     def test_action_window_preserves_callback_from_before_ack_over_real_tls(self):
+        self._window_callback_case(named_focus=False, after_ack=False)
+
+    def test_named_focus_window_leaves_early_callback_diagnostic_over_real_tls(self):
+        self._window_callback_case(named_focus=True, after_ack=False)
+
+    def test_named_focus_window_accepts_confirmed_after_ack_callback_over_real_tls(self):
+        self._window_callback_case(named_focus=True, after_ack=True)
+
+    def _window_callback_case(self, *, named_focus, after_ack):
         clock = Mock(return_value=10.0)
         controller = Mock()
         self.session = mcp.bridge.Session(controller, clock=clock)
         self.server.session = self.session
         self.session.session(dict(v=1, session_id=SESSION, state='start',
                                   capture_protocol=mcp.bridge.CAPTURE_PROTOCOL), principal='legacy')
-        server = mcp.MCP(mcp.Tools(self.directory))
+        server = mcp.MCP(mcp.Tools(self.directory, keyboard_focus_enabled=named_focus))
         initialize(server)
         context = ssl.create_default_context(cafile=str(self.directory / 'certificate.pem'))
         phone = http.client.HTTPSConnection('127.0.0.1', self.config['port'], context=context, timeout=5)
@@ -1146,7 +1176,7 @@ class StableOriginTLSTests(unittest.TestCase):
                        'X-StreamShot-Width': '2', 'X-StreamShot-Height': '3',
                        'X-StreamShot-Orientation': '1', 'X-StreamShot-Geometry-Epoch': '1',
                        'X-StreamShot-Capture-Wait-Ms': '150', 'X-StreamShot-Encode-Ms': '2',
-                       'X-StreamShot-Callback-Age-Ms': '52'}
+                       'X-StreamShot-Callback-Age-Ms': '20' if after_ack else '52'}
             if offset is not None:
                 headers['X-StreamShot-Callback-Offset-Ms'] = str(offset)
             self.assertEqual(request_phone('POST', '/v1/frame', headers, JPEG)[0], 201)
@@ -1163,7 +1193,7 @@ class StableOriginTLSTests(unittest.TestCase):
                 self.assertEqual(finished['request_id'], ticket['request_id'])
                 self.assertEqual(controller.perform.call_count, 1)
                 clock.return_value = 11.17
-                upload(ticket, 2, offset=100)
+                upload(ticket, 2, offset=150 if after_ack else 100)
             except Exception as error:
                 errors.append(error)
 
@@ -1180,6 +1210,8 @@ class StableOriginTLSTests(unittest.TestCase):
         clock.return_value = 11.0
         frame = json.loads(screen['content'][1]['text'])
         args = act(frame_id=frame['frame_id'], settle_ms=0)
+        if named_focus:
+            args['actions'] = [{'op': 'focus_next'}]
         result = tool(server, 'streamshot_act', args, 211)['result']
         worker.join(6)
         self.assertFalse(worker.is_alive())
@@ -1187,10 +1219,12 @@ class StableOriginTLSTests(unittest.TestCase):
         self.assertFalse(result['isError'], result['content'][0]['text'])
         receipt = json.loads(result['content'][0]['text'])
         self.assertEqual(receipt['acknowledged'], 1)
-        self.assertEqual(receipt['screen_status'], 'captured')
-        self.assertEqual(receipt['screen']['input_relation'], 'during_last_input')
-        self.assertEqual(receipt['screen']['source_callback_offset_ms'], 100)
-        self.assertTrue(receipt['screen']['usable_for_input'])
+        usable = not named_focus or after_ack
+        self.assertEqual(receipt['screen_status'], 'captured' if usable else 'captured_observe_again')
+        self.assertEqual(receipt['screen']['input_relation'], 'after_last_ack' if after_ack else 'during_last_input')
+        self.assertEqual(receipt['screen']['source_callback_offset_ms'], 150 if after_ack else 100)
+        self.assertIs(receipt['screen']['usable_for_input'], usable)
+        self.assertEqual(server.tools.observation is not None, usable)
         self.assertEqual(base64.b64decode(result['content'][1]['data']), JPEG)
         self.assertIsNone(self.session.pending)
         replay = tool(server, 'streamshot_act', args, 211)['result']

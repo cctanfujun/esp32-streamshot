@@ -115,6 +115,34 @@ test('only an awaited explicit display makes a received screen usable', async ()
   await client.close();
 });
 
+test('an explicitly requested cached image can be displayed but never arms input', async () => {
+  const seen=[];
+  const child=fake((message,process)=>{
+    seen.push(message.params);
+    const result=screenResult();
+    if(message.params.arguments.cached_on_silence){
+      const screen=JSON.parse(result.content[1].text);
+      result.content[1].text=JSON.stringify({...screen,capture_origin:'cached',usable_for_control:false,cached_age_ms:500});
+    }
+    answer(process,message,result);
+  });
+  const client=new StreamShotSession(child);
+  await client.inspect(await client.screen(),async ({summary})=>{
+    assert.ok(summary.client.observation_remaining_ms>0);
+  });
+  const cached=await client.screen({cached_on_silence:true});
+  const {observed}=await client.inspect(cached,async ({summary,images})=>{
+    assert.equal(summary.client.observation_remaining_ms,0);
+    assert.equal(summary.screen.capture_origin,'cached');
+    assert.equal(summary.screen.cached_age_ms,500);
+    assert.equal(images.length,1);
+  });
+  assert.equal(observed,false);
+  await assert.rejects(client.act([{op:'click',button:'left'}]),/fresh_observed/);
+  assert.equal(seen.length,2);
+  await client.close();
+});
+
 test('act uses session-owned inspected metadata and requires inspection of its new image', async () => {
   const seen=[];
   const child=fake((message,process)=>{

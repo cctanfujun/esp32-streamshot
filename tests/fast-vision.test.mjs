@@ -3,7 +3,7 @@ import { PassThrough, Writable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FastVisionAdvisor, readFocusEvidence } from '../skills/esp32-streamshot/scripts/fast-vision.mjs';
+import { FastVisionAdvisor, readFocusEvidence, reviewFocus } from '../skills/esp32-streamshot/scripts/fast-vision.mjs';
 
 const encode = value => JSON.stringify(value);
 const frame = () => ({ summary: { screen: { frame_id: randomUUID(), session_id: randomUUID() } },
@@ -22,7 +22,8 @@ test('visible focus requires a label that matches the claim and a strict result'
     { status: 'no_visible_focus', visible_focus: null });
 });
 
-function harness({ injection, model = 'gpt-6-luna', timeoutMs = 200, phase = 'final_answer' } = {}) {
+function harness({ injection, model = 'gpt-6-luna', timeoutMs = 200, phase = 'final_answer',
+  startDelay = 0, answerDelay = 0 } = {}) {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
   child.kill = () => {};
@@ -34,8 +35,10 @@ function harness({ injection, model = 'gpt-6-luna', timeoutMs = 200, phase = 'fi
     call.push([method, params]);
     if (method === 'thread/start') {
       threadId = randomUUID();
-      publish({ id, result: { model, modelProvider: 'openai', reasoningEffort: 'low',
+      const send = () => publish({ id, result: { model, modelProvider: 'openai', reasoningEffort: 'low',
         thread: { id: threadId, ephemeral: true } } });
+      if (startDelay) setTimeout(send, startDelay);
+      else send();
     }
     if (method === 'turn/start') {
       const turnId = randomUUID();
@@ -44,9 +47,13 @@ function harness({ injection, model = 'gpt-6-luna', timeoutMs = 200, phase = 'fi
       else if (injection === 'item') publish({ method: 'item/started', params: { threadId, turnId,
         item: { type: 'mcpToolCall' } } });
       else if (injection !== 'hang') {
-        publish({ method: 'item/completed', params: { threadId, turnId,
-          item: { type: 'agentMessage', phase, text: focused } } });
-        publish({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
+        const send = () => {
+          publish({ method: 'item/completed', params: { threadId, turnId,
+            item: { type: 'agentMessage', phase, text: focused } } });
+          publish({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
+        };
+        if (answerDelay) setTimeout(send, answerDelay);
+        else send();
       }
     }
     if (method === 'thread/unsubscribe') publish({ id, result: {} });
@@ -79,6 +86,7 @@ test('missing, diagnostic, expired and non-JPEG observations never start a model
     f => { f.images = []; },
     f => { f.images[0].data = 'eW8='; },
     f => { f.summary.screen_status = 'captured_observe_again'; },
+    f => { f.summary.screen.usable_for_control = false; },
     f => { f.summary.screen.observation_age_ms = 31000; },
   ]) {
     const f = frame();
@@ -105,4 +113,88 @@ test('a stalled turn times out without retry', async () => {
   await assert.rejects(client.inspect(frame(), 'Touch'), /fast_vision_timeout/);
   await assert.rejects(client.inspect(frame(), 'Touch'), /fast_vision_unavailable/);
   assert.deepEqual(call.map(([m]) => m), ['thread/start', 'turn/start']);
+});
+
+test('thread startup and image reasoning share the caller deadline', async () => {
+  const { client, call } = harness({ timeoutMs: 500, startDelay: 70, answerDelay: 80 });
+  await assert.rejects(client.inspect(frame(), 'Touch', { maxWaitMs: 115 }), /fast_vision_timeout/);
+  assert.deepEqual(call.map(([method]) => method), ['thread/start', 'turn/start']);
+});
+
+function displayHarness(view, observed = true) {
+  const trace = [];
+  const result = { opaque: true };
+  const session = {
+    async inspect(received, callback) {
+      assert.equal(received, result);
+      trace.push('inspect');
+      await callback(view);
+      return { observed };
+    },
+    act() { assert.fail('review should not send input'); },
+    screen() { assert.fail('review should not fetch another frame'); },
+  };
+  const display = shown => {
+    assert.equal(shown, view);
+    trace.push('display');
+  };
+  return { session, result, display, trace };
+}
+
+test('focus review emits one view and only returns frame-bound advisory evidence', async () => {
+  const view = frame();
+  const { session, result, display, trace } = displayHarness(view);
+  const advisor = { async inspect(observed, target, { maxWaitMs }) {
+    assert.equal(observed, view);
+    assert.equal(target, 'Touch');
+    assert.ok(maxWaitMs <= 6000 && maxWaitMs > 5000);
+    trace.push('advisor');
+    return { ...view.summary.screen, ...JSON.parse(focused), actions: [{ op: 'focus_activate' }] };
+  } };
+  const review = await reviewFocus(session, result, { target: 'Touch', display, advisor });
+  assert.deepEqual(trace, ['inspect', 'display', 'advisor']);
+  assert.deepEqual(review, { route: 'advisor', ...view.summary.screen, ...JSON.parse(focused) });
+});
+
+test('timeout, uncertain result and wrong frame fall back to the same displayed image', async () => {
+  for (const [reason, inspect] of [
+    ['advisor_timeout', async () => { throw new Error('fast_vision_timeout'); }],
+    ['advisor_unavailable', async () => { throw new Error('other_error'); }],
+    ['no_visible_focus', async view => ({ ...view.summary.screen, status: 'no_visible_focus', visible_focus: null })],
+    ['evidence_mismatch', async () => ({ ...frame().summary.screen, ...JSON.parse(focused) })],
+  ]) {
+    const { session, result, display, trace } = displayHarness(frame());
+    const review = await reviewFocus(session, result, { target: 'Touch', display, advisor: { inspect } });
+    assert.deepEqual(review, { route: 'main', reason });
+    assert.deepEqual(trace, ['inspect', 'display']);
+  }
+});
+
+test('cached evidence cannot be uploaded by focus review or become usable input', async () => {
+  const view = frame();
+  view.summary.screen.usable_for_control = false;
+  view.summary.screen.capture_origin = 'cached';
+  const { session, result, display, trace } = displayHarness(view, false);
+  const advisor = { async inspect() { trace.push('unexpected-advisor'); } };
+  assert.deepEqual(await reviewFocus(session, result, { target: 'Touch', display, advisor }),
+    { route: 'blocked', reason: 'fresh_observation_required' });
+  assert.deepEqual(trace, ['inspect', 'display']);
+});
+
+test('review skips advisor upload when the session has no usable lifetime left', async () => {
+  const view = frame();
+  view.summary.client = { observation_remaining_ms: 0 };
+  const { session, result, display, trace } = displayHarness(view, false);
+  const advisor = { async inspect() { trace.push('unexpected-advisor'); } };
+  assert.deepEqual(await reviewFocus(session, result, { target: 'Touch', display, advisor }),
+    { route: 'blocked', reason: 'fresh_observation_required' });
+  assert.deepEqual(trace, ['inspect', 'display']);
+});
+
+test('the session can block candidates received after the frame is unusable', async () => {
+  const view = frame();
+  const { session, result, display } = displayHarness(view, false);
+  const advisor = { async inspect() { return { ...view.summary.screen, ...JSON.parse(focused) }; } };
+  assert.deepEqual(await reviewFocus(session, result, { target: 'Touch', display, advisor }),
+    { route: 'blocked', reason: 'fresh_observation_required' });
 });

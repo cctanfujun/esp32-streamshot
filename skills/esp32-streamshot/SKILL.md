@@ -43,12 +43,15 @@ desktop adapter with `STREAMSHOT_IOS_FULL_KEYBOARD_ACCESS=1`, or pass
 new image visibly confirms the highlighted target, issue `focus_activate`
 separately with the matching `observed_focus` label. A key ACK alone never
 confirms highlight or activation. If ReplayKit provides no new image, do not
-repeat input, infer that it failed, or reuse the previous image.
+repeat input or infer it failed. A standalone `streamshot_get_screen` with
+`cached_on_silence:true` may show a recent previously requested image for
+context only. It displays the original age, and cannot authorize keyboard,
+mouse, or a fast focus decision. This option never proves an action's result.
 
 The [optional fast advisor](references/fast-vision.md) can help identify visible
 focus using the already signed-in Codex service and standard usage. It never
 sends HID input. Only use it for an image the owner intends to share with that
-service; continue with the main agent if the advisor is slow or uncertain.
+service; its review helper hands the same image to the main agent if the advisor is slow or uncertain.
 
 ## Interruptions
 

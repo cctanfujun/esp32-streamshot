@@ -13,6 +13,7 @@ import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -39,6 +40,7 @@ MAX_SEQUENCE = 2147483647
 SCREEN_RECOVERY_PROTOCOL = 'resume-from-v1'
 CAPTURE_PROTOCOL = 'settle-ticket-v1'
 MAX_SETTLE_MS = 1000
+CACHED_PREVIEW_MAX_AGE_MS = 30000
 FRAME_TIMINGS = {'capture-wait-ms': 'capture_wait_ms', 'encode-ms': 'encode_ms',
                  'callback-age-ms': 'source_callback_age_ms'}
 WINDOW_CALLBACK_HEADER = 'callback-offset-ms'
@@ -151,7 +153,8 @@ def reset_arguments(value):
 
 
 def screen_arguments(value):
-    if not isinstance(value, dict) or set(value) not in (set(), {'settle_ms'}):
+    if (not isinstance(value, dict) or set(value) - {'settle_ms', 'cached_on_silence'}
+            or type(value.get('cached_on_silence', False)) is not bool):
         raise Failure('invalid_fields')
     return integer(value.get('settle_ms', 0), 0, MAX_SETTLE_MS)
 
@@ -442,6 +445,7 @@ class Session:
         self.geometry = None
         self.frame = None
         self.observation_epoch = 0
+        self.input_revision = 0
         self.sequence = 0
         self.pending = None
         self.result = None
@@ -797,15 +801,41 @@ class Session:
                           'sequence': sequence, 'width': geometry[1], 'height': geometry[2],
                           'orientation': geometry[3], 'geometry_epoch': geometry[0], 'received': observed,
                           'digest': digest, 'jpeg': data,
-                          'observation_epoch': pending['observation_epoch'], **window}
+                          'observation_epoch': pending['observation_epoch'],
+                          'preview_observed_at': min(observed, pending.get('created_at', observed)),
+                          'preview_allowed': (not pending.get('commands') and not self.input_busy
+                                              and not self.control_reset_busy
+                                              and pending.get('input_revision') == self.input_revision),
+                          **window}
             if timings:
                 self.frame.update(timings, observation_age_ms=min(5000, max(0, int((now - observed) * 1000))))
             self.result = self.frame; self.pending = None
             self.last_heartbeat = self.clock()
             self.condition.notify_all()
 
-    def capture(self, timeout=8, settle_ms=0):
+    def _cached_preview(self):
+        """Return the last uploaded picture strictly for viewing, never input."""
+        frame = self.frame
+        if (not frame or not frame.get('preview_allowed') or self.input_busy or self.control_reset_busy
+                or self.unknown or self.control_reset_required
+                or frame['session_id'] != self.identity or frame['observation_epoch'] != self.observation_epoch
+                or (frame['geometry_epoch'], frame['width'], frame['height'], frame['orientation']) != self.geometry):
+            return None
+        age = self.clock() - frame['preview_observed_at']
+        if not 0 <= age <= CACHED_PREVIEW_MAX_AGE_MS / 1000:
+            return None
+        # The original ID might have been usable in a different client. Once
+        # shown as cached it cannot authorize any further direct HTTP action,
+        # without minting a frame or refreshing its original timestamp.
+        self.frame = dict(frame, usable_for_input=False)
+        fields = ('frame_id', 'session_id', 'width', 'height', 'orientation', 'geometry_epoch', 'jpeg')
+        return dict({field: frame[field] for field in fields}, capture_origin='cached',
+                    cached_age_ms=math.ceil(age * 1000), usable_for_control=False)
+
+    def capture(self, timeout=8, settle_ms=0, cached_on_silence=False):
         integer(settle_ms, 0, MAX_SETTLE_MS)
+        if type(cached_on_silence) is not bool:
+            raise Failure('invalid_fields')
         with self.condition:
             self._require(self.identity)
             if settle_ms and self.phone_capture_protocol != CAPTURE_PROTOCOL:
@@ -814,9 +844,10 @@ class Session:
                 raise Failure('capture_busy', 409)
             self.capture_busy = True
             self.result = None
-            self.pending = {'id': str(uuid.uuid4()), 'deadline': self.clock() + 5, 'created_at': self.clock(),
-                            'settle_ms': settle_ms,
-                            'observation_epoch': self.observation_epoch}
+            pending = {'id': str(uuid.uuid4()), 'deadline': self.clock() + 5, 'created_at': self.clock(),
+                       'settle_ms': settle_ms, 'observation_epoch': self.observation_epoch,
+                       'input_revision': self.input_revision}
+            self.pending = pending
             identity = self.identity
             self.condition.notify_all()
             try:
@@ -829,6 +860,11 @@ class Session:
                     raise Failure('capture_not_received', 408)
                 result = self.result
                 if 'capture_error' in result:
+                    if (cached_on_silence and result['capture_error'] == 'capture_no_video_sample'
+                            and self.clock() < pending['deadline']):
+                        preview = self._cached_preview()
+                        if preview is not None:
+                            return preview
                     raise Failure(result['capture_error'], 408)
                 self.unknown = False
                 return result
@@ -952,6 +988,9 @@ class Session:
             control_identity = (active_control or self.retired_control_identity or str(uuid.uuid4())
                                 if operation == 'release_all' else active_control)
             generation = self.control_generation
+            self.input_revision += 1
+            if self.frame:
+                self.frame['preview_allowed'] = False
             self.input_busy = True
             result = {'ok': False, 'status': 'outcome_unknown', 'id': value['id']}
             record = {'digest': digest, 'result': result}
@@ -1191,6 +1230,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header('X-StreamShot-Source-Callback-Offset-Ms', str(metadata['source_callback_offset_ms']))
                 self.send_header('X-StreamShot-Input-Relation', metadata['input_relation'])
                 self.send_header('X-StreamShot-Usable-For-Input', '1' if metadata['usable_for_input'] else '0')
+            if metadata.get('capture_origin') == 'cached':
+                self.send_header('X-StreamShot-Capture-Origin', 'cached')
+                self.send_header('X-StreamShot-Cached-Age-Ms', str(metadata['cached_age_ms']))
+                self.send_header('X-StreamShot-Usable-For-Control', '0')
         self.end_headers()
         if data:
             self.wfile.write(data)
@@ -1268,8 +1311,9 @@ class Handler(BaseHTTPRequestHandler):
             self.server.session.accept_frame(headers, self._body(image=True), principal=principal)
             return self._reply(201, {'ok': True})
         if self.command == 'POST' and path == '/v1/screen':
-            settle = screen_arguments(self._body())
-            value = self.server.session.capture(settle_ms=settle)
+            body = self._body()
+            settle = screen_arguments(body)
+            value = self.server.session.capture(settle_ms=settle, cached_on_silence=body.get('cached_on_silence', False))
             return self._reply(200, image=value['jpeg'], metadata=value)
         if self.command == 'POST' and path == '/v1/screen/prepare':
             return self._reply(200, self.server.session.prepare_window(self._body()))

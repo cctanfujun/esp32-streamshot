@@ -31,6 +31,9 @@ const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const LABEL = /^[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]{1,120}$/u;
 const MAX_B64 = Math.ceil(1024 * 1024 / 3) * 4;
 const MAX_LINE = MAX_B64 * 2;
+const MAX_OBSERVATION_AGE_MS = 30000;
+const DEFAULT_REVIEW_WAIT_MS = 6000;
+const validTimeout = value => Number.isInteger(value) && value >= 100 && value <= 25000;
 const norm = label => label.normalize('NFKC').trim().toLowerCase();
 
 export function readFocusEvidence(value, target) {
@@ -47,12 +50,13 @@ export function readFocusEvidence(value, target) {
   return data;
 }
 
-function observation({ summary, images }, target) {
+function observation({ summary, images } = {}, target) {
   const frame = summary?.screen;
   const image = images?.[0];
   if (typeof target !== 'string' || !LABEL.test(target) || !norm(target) ||
       summary?.ok === false || (summary?.screen_status != null && summary.screen_status !== 'captured') ||
-      (Number.isFinite(frame?.observation_age_ms) && frame.observation_age_ms >= 30000) ||
+      frame?.usable_for_control === false || frame?.capture_origin === 'cached' ||
+      (Number.isFinite(frame?.observation_age_ms) && frame.observation_age_ms >= MAX_OBSERVATION_AGE_MS) ||
       !UUID.test(frame?.frame_id ?? '') ||
       !UUID.test(frame?.session_id ?? '') || images?.length !== 1 ||
       image?.mimeType !== 'image/jpeg' || typeof image.data !== 'string' ||
@@ -68,7 +72,7 @@ function observation({ summary, images }, target) {
 
 export class FastVisionAdvisor {
   static async start({ codex = 'codex', timeoutMs = 12000 } = {}) {
-    if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 25000) throw new Error('fast_vision_invalid_timeout');
+    if (!validTimeout(timeoutMs)) throw new Error('fast_vision_invalid_timeout');
     const cwd = await mkdtemp(join(tmpdir(), 'streamshot-vision-'));
     let client;
     try {
@@ -118,11 +122,11 @@ export class FastVisionAdvisor {
     this.child.kill('SIGTERM');
   }
 
-  rpc(method, params) {
+  rpc(method, params, timeoutMs = this.timeoutMs) {
     if (this.closed) return Promise.reject(new Error('fast_vision_closed'));
     const id = this.next++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => this.abort('fast_vision_timeout'), this.timeoutMs);
+      const timer = setTimeout(() => this.abort('fast_vision_timeout'), timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.send({ id, method, params });
     });
@@ -168,23 +172,32 @@ export class FastVisionAdvisor {
     }
   }
 
-  async inspect(display, target) {
+  async inspect(display, target, { maxWaitMs = this.timeoutMs } = {}) {
+    if (!validTimeout(maxWaitMs)) throw new Error('fast_vision_invalid_timeout');
     if (this.busy || this.closed) throw new Error('fast_vision_unavailable');
     const { frame, data } = observation(display, target);
     this.busy = true;
     const started = performance.now();
+    const deadline = started + Math.min(this.timeoutMs, maxWaitMs);
+    const remaining = () => {
+      const left = Math.ceil(deadline - performance.now());
+      if (left > 0) return left;
+      this.abort('fast_vision_timeout');
+      throw new Error('fast_vision_timeout');
+    };
     let threadId;
     try {
       const info = await this.rpc('thread/start', { ephemeral: true, model: MODEL, cwd: this.cwd,
         environments: [], sandbox: 'read-only', approvalPolicy: 'never', allowProviderModelFallback: false,
-        config: { model_reasoning_effort: 'low' }, developerInstructions: INSTRUCTIONS });
+        config: { model_reasoning_effort: 'low' }, developerInstructions: INSTRUCTIONS }, remaining());
       if (info?.model !== MODEL || info?.modelProvider !== 'openai' || info?.thread?.ephemeral !== true ||
           info.reasoningEffort !== 'low' || typeof info.thread.id !== 'string') {
         this.abort('fast_vision_route_changed'); throw new Error('fast_vision_route_changed');
       }
       threadId = info.thread.id;
+      const turnBudget = remaining();
       const outcome = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => this.abort('fast_vision_timeout'), this.timeoutMs);
+        const timer = setTimeout(() => this.abort('fast_vision_timeout'), turnBudget);
         this.task = { threadId, timer, resolve, reject };
       });
       const [turn, [finished, answer]] = await Promise.all([
@@ -192,9 +205,10 @@ export class FastVisionAdvisor {
           serviceTierForTurn: 'default', approvalPolicy: 'never',
           sandboxPolicy: { type: 'readOnly', networkAccess: false },
           input: [{ type: 'text', text: 'Exact target label: ' + JSON.stringify(target), text_elements: [] },
-            { type: 'image', url: 'data:image/jpeg;base64,' + data, detail: 'auto' }], outputSchema: SCHEMA }),
+            { type: 'image', url: 'data:image/jpeg;base64,' + data, detail: 'auto' }], outputSchema: SCHEMA }, turnBudget),
         outcome,
       ]);
+      remaining();
       if (turn?.turn?.id !== finished) throw new Error('fast_vision_protocol');
       return { frame_id: frame.frame_id, session_id: frame.session_id, model: MODEL,
         elapsed_ms: Math.round(performance.now() - started),
@@ -212,4 +226,49 @@ export class FastVisionAdvisor {
     this.abort('fast_vision_closed');
     await rm(this.cwd, { force: true, recursive: true });
   }
+}
+
+/**
+ * Inspect exactly one StreamShot result. The advisor is optional and has no
+ * access to the session's controls. On failure the main agent reviews the
+ * frame already emitted by display(), without taking another capture.
+ */
+export async function reviewFocus(session, result, { target, display, advisor, maxWaitMs = DEFAULT_REVIEW_WAIT_MS }) {
+  if (typeof display !== 'function' || typeof target !== 'string' || !LABEL.test(target) || !norm(target) ||
+      !validTimeout(maxWaitMs)) throw new Error('fast_vision_invalid_review');
+  let review = { route: 'main', reason: 'advisor_unavailable' };
+  const seen = await session.inspect(result, async view => {
+    const began = performance.now();
+    await display(view);
+    if (!advisor) return;
+    let frame;
+    try { ({ frame } = observation(view, target)); }
+    catch { review = { route: 'main', reason: 'no_usable_image' }; return; }
+    const age = Math.max(frame.source_callback_age_ms ?? 0, frame.observation_age_ms ?? 0);
+    const sessionRemaining = view.summary.client?.observation_remaining_ms;
+    const available = Math.min(MAX_OBSERVATION_AGE_MS - age,
+      Number.isFinite(sessionRemaining) ? sessionRemaining : MAX_OBSERVATION_AGE_MS);
+    const wait = Math.floor(Math.min(maxWaitMs, available - (performance.now() - began)));
+    if (!validTimeout(wait)) { review = { route: 'main', reason: 'no_time_for_advisor' }; return; }
+    let evidence;
+    try { evidence = await advisor.inspect(view, target, { maxWaitMs: wait }); }
+    catch (error) {
+      review = { route: 'main', reason: error?.message === 'fast_vision_timeout' ? 'advisor_timeout' : 'advisor_unavailable' };
+      return;
+    }
+    if (evidence?.frame_id !== frame.frame_id || evidence?.session_id !== frame.session_id) {
+      review = { route: 'main', reason: 'evidence_mismatch' };
+      return;
+    }
+    const focus = readFocusEvidence(JSON.stringify({ status: evidence.status, visible_focus: evidence.visible_focus }), target);
+    if (focus.status === 'unclear' || focus.status === 'no_visible_focus') {
+      review = { route: 'main', reason: focus.status };
+      return;
+    }
+    review = { route: 'advisor', frame_id: frame.frame_id, session_id: frame.session_id, ...focus };
+  });
+  // Only the StreamShot session can say whether the frame is current, has not
+  // been consumed by other input and may still be used as an observation.
+  if (seen?.observed !== true) return { route: 'blocked', reason: 'fresh_observation_required' };
+  return review;
 }

@@ -194,7 +194,8 @@ export class StreamShotSession {
         const trace = this.trace(name, timing, rendered.data);
         // Keep only metadata. Image ownership remains with the caller/result.
         this.results.set(result, { generation, started, receivedAt, timing, trace, frame: rendered.frame,
-          eligible: !!rendered.frame &&
+          eligible: !!rendered.frame && rendered.frame.usable_for_control !== false &&
+            rendered.frame.capture_origin !== 'cached' &&
             (name === 'streamshot_get_screen' && !result.isError ||
               name === 'streamshot_act' && rendered.data?.screen_status === 'captured') });
         return result;
@@ -221,15 +222,17 @@ export class StreamShotSession {
     this.observation = null;
     const started = performance.now();
     const rendered = view(result);
-    // The callback must emit the image for the agent to inspect. Receiving a
-    // tool result alone never makes it an observation usable by act().
-    try {
-      await display({ summary: { ...rendered.summary, client: { ...context.timing } }, images: rendered.images });
-    } finally { context.trace.display_ms = elapsed(started); }
-    if (context.generation !== this.generation || this.closed) throw new Error('screen_result_superseded');
     const frame = context.frame;
     const age = Math.max(frame?.source_callback_age_ms ?? 0, frame?.observation_age_ms ?? 0);
     const expiresAt = Math.min(context.started, context.receivedAt - age) + 30000;
+    const remaining = context.eligible && !this.uncertain ? Math.max(0, Math.floor(expiresAt - started)) : 0;
+    // The callback must emit the image for the agent to inspect. Receiving a
+    // tool result alone never makes it an observation usable by act().
+    try {
+      await display({ summary: { ...rendered.summary, client: { ...context.timing, observation_remaining_ms: remaining } },
+        images: rendered.images });
+    } finally { context.trace.display_ms = elapsed(started); }
+    if (context.generation !== this.generation || this.closed) throw new Error('screen_result_superseded');
     const inspectedAt = performance.now();
     const observed = context.eligible && !this.uncertain && inspectedAt < expiresAt;
     if (observed) this.observation = { frame: Object.freeze({ ...frame }), inspectedAt, expiresAt };
