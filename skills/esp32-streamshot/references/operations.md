@@ -14,6 +14,8 @@ Use native MCP tools when available. A task normally needs one status check, one
 
 Key usages follow USB HID. Left Ctrl=1, Shift=2, Alt=4, GUI/Command=8. [Apple documents Command-Space for Search on Magic Keyboard](https://support.apple.com/guide/iphone/iph3da414515/ios); this does not establish its behavior on an arbitrary BLE keyboard. Verify Home/Search once during setup, using the visible AssistiveTouch menu or a configured device button when appropriate. Do not repeatedly guess shortcuts during a timed task.
 
+A wheel step must use `dy` from -16 to 16. For longer travel in a verified scrollable view, batch a few bounded steps. An invalid-argument rejection is known unsent: inspect a fresh frame and correct the request without resetting desktop input. A missing or unknown hardware result still follows the reset rule.
+
 Each primitive checks the same session, geometry and fresh observation. Unknown input stops the remainder; never automatically obtain a new frame and continue a partially executed macro. Capture failure after ACK is distinct from input failure. Replaying an RPC returns only its small input receipt, without image caching or further I/O.
 
 With a window-capable app, the phone confirms a capture window before the bridge sends input. The phone can keep the last ReplayKit callback that arrived during a short transition and send one frame after settling. Older compatible apps use a ticket after input. A frame captured too early is shown with `captured_observe_again` and requires a new observation before more input. The result reports `source_callback_offset_ms` and `input_relation` for window captures. `capture_prepare_ms`, `input_ms`, `capture_ms`, and `total_ms` measure host activity. Verify the visible UI outcome separately.

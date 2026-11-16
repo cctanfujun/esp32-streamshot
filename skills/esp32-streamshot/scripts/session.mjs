@@ -81,7 +81,15 @@ export class StreamShotSession {
       const pending = this.pending.get(message.id);
       if (!pending) continue;
       clearTimeout(pending.timer); this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error('mcp_rpc_error'));
+      if (message.error) {
+        // The local bridge validates the complete tool input before any I/O.
+        // Only this exact protocol error proves no action was sent.
+        const invalidArguments = message.jsonrpc === '2.0' && message.error.code === -32602 &&
+          message.error.message === 'invalid_tool_arguments';
+        pending.reject(invalidArguments
+          ? Object.assign(new Error('invalid_tool_arguments'), { knownUnsent: true })
+          : new Error('mcp_rpc_error'));
+      }
       else if (message.jsonrpc === '2.0' && message.result && typeof message.result === 'object') pending.resolve(message.result);
       else { pending.reject(new Error('invalid_mcp_response')); this.fail('invalid_mcp_response', true); }
     }
@@ -191,7 +199,7 @@ export class StreamShotSession {
       } catch (error) {
         timing.rpc_ms = elapsed(started); timing.roundtrip_ms = elapsed(queuedAt);
         this.trace(name, { ...timing, failed: true });
-        if (MUTATING.has(name)) this.uncertain = true;
+        if (MUTATING.has(name) && error?.knownUnsent !== true) this.uncertain = true;
         throw error;
       }
     };

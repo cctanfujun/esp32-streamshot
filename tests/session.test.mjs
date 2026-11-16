@@ -150,6 +150,22 @@ test('act without an explicit hold leaves it to the bridge', async () => {
   await client.close();
 });
 
+test('verified invalid arguments do not latch an unknown hardware outcome', async () => {
+  const child=fake((message, process)=>{
+    const {name, arguments: args}=message.params;
+    if (name==='streamshot_get_screen') answer(process,message,screenResult());
+    else if (args.actions[0].dy===-36) process.stdout.write(JSON.stringify({jsonrpc:'2.0',
+      id:message.id,error:{code:-32602,message:'invalid_tool_arguments'}})+'\n');
+    else answer(process,message,actResult());
+  });
+  const client=new StreamShotSession(child);
+  await client.inspect(await client.screen(),async()=>{});
+  await assert.rejects(client.act([{op:'scroll',dy:-36}]),/invalid_tool_arguments/);
+  await client.inspect(await client.screen(),async()=>{});
+  assert.equal((await client.act([{op:'scroll',dy:-16}])).isError,false);
+  await client.close();
+});
+
 test('queued acts cannot reuse the observation consumed by the first act', async () => {
   const names=[];
   const child=fake((message,process)=>{
