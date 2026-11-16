@@ -3,7 +3,6 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { env as processEnv } from 'node:process';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
@@ -20,6 +19,14 @@ const DISABLED = ['shell_tool', 'apps', 'plugins', 'hooks', 'image_generation', 
 const BASE = [...DISABLED.flatMap(flag => ['--disable', flag]),
   '-c', 'web_search="disabled"', '-c', 'model_provider="openai"', '-c', 'force_login_method="chatgpt"',
   '-c', 'analytics.enabled=false'];
+// Use the system launcher so this works in the restricted Codex Node REPL,
+// and scrub alternate authentication, provider and logging overrides for this child.
+const ENV = '/usr/bin/env';
+const CLEAN_ENV = ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_ORGANIZATION',
+  'OPENAI_ORG_ID', 'OPENAI_PROJECT', 'OPENAI_PROJECT_ID', 'OPENAI_ENDPOINT', 'CODEX_API_KEY',
+  'CODEX_MODEL_PROVIDER', 'CODEX_CHATGPT_BASE_URL', 'AZURE_OPENAI_API_KEY', 'AZURE_OPENAI_ENDPOINT',
+  'CHATGPT_BASE_URL', 'RUST_LOG', 'OTEL_EXPORTER_OTLP_ENDPOINT', 'OTEL_EXPORTER_OTLP_HEADERS',
+  'OTEL_EXPORTER_OTLP_LOGS_ENDPOINT', 'OTEL_EXPORTER_OTLP_LOGS_HEADERS'].flatMap(key => ['-u', key]);
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const LABEL = /^[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]{1,120}$/u;
 const MAX_B64 = Math.ceil(1024 * 1024 / 3) * 4;
@@ -63,13 +70,11 @@ export class FastVisionAdvisor {
   static async start({ codex = 'codex', timeoutMs = 12000 } = {}) {
     if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 25000) throw new Error('fast_vision_invalid_timeout');
     const cwd = await mkdtemp(join(tmpdir(), 'streamshot-vision-'));
-    const env = Object.fromEntries(Object.entries(processEnv).filter(([key]) =>
-      !/^(?:OPENAI_(?:API|BASE|ORGANIZATION|ORG|PROJECT|CUSTOMER|ENDPOINT)|CODEX_(?:API|MODEL_PROVIDER|CHATGPT_BASE_URL)|AZURE_OPENAI_|OTEL_)/.test(key)));
     let client;
     try {
       const list = async overrides => {
-        const { stdout } = await exec(codex, [...BASE, ...overrides, 'mcp', 'list', '--json'],
-          { cwd, env, timeout: 5000, maxBuffer: 128 * 1024 });
+        const { stdout } = await exec(ENV, [...CLEAN_ENV, codex, ...BASE, ...overrides, 'mcp', 'list', '--json'],
+          { cwd, timeout: 5000, maxBuffer: 128 * 1024 });
         const result = JSON.parse(stdout);
         if (!Array.isArray(result)) throw new Error();
         return result;
@@ -79,8 +84,8 @@ export class FastVisionAdvisor {
         return ['-c', `mcp_servers.${name}.enabled=false`];
       });
       if ((await list(overrides)).some(server => server.enabled !== false)) throw new Error();
-      client = new FastVisionAdvisor(spawn(codex, [...BASE, ...overrides, 'app-server', '--listen', 'stdio://'],
-        { cwd, env, stdio: ['pipe', 'pipe', 'ignore'] }), cwd, timeoutMs);
+      client = new FastVisionAdvisor(spawn(ENV, [...CLEAN_ENV, codex, ...BASE, ...overrides, 'app-server', '--listen', 'stdio://'],
+        { cwd, stdio: ['pipe', 'pipe', 'ignore'] }), cwd, timeoutMs);
       await client.rpc('initialize', { clientInfo: { name: 'streamshot-fast-vision', version: '1.0.0' },
         capabilities: { experimentalApi: true } });
       client.send({ method: 'initialized' });
