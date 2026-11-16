@@ -367,6 +367,74 @@ class ProtocolTests(unittest.TestCase):
         self.factory.assert_not_called()
         self.assertEqual(self.server.control_calls, {})
 
+    def test_named_focus_is_hidden_and_cannot_send_input_without_opt_in(self):
+        initialize(self.server)
+        self.assertNotIn('focus_activate', json.dumps(self.server.handle(request('tools/list'))))
+        result = tool(self.server, 'streamshot_act', act(actions=[{'op': 'focus_next'}]))['result']
+        self.assertTrue(result['isError'])
+        self.assertEqual(json.loads(result['content'][0]['text'])['error'], 'keyboard_focus_not_enabled')
+        self.factory.assert_not_called()
+
+    def test_focus_moves_and_activates_only_on_a_separately_observed_highlight(self):
+        self.tools.keyboard_focus_enabled = True
+        initialize(self.server)
+        tool(self.server, 'streamshot_get_screen', identity=400)
+        after_next, after_previous, after_activate = (str(uuid.uuid4()) for _ in range(3))
+        self.client.next_frame = after_next
+        forward = act(actions=[{'op': 'focus_next', 'count': 2}])
+        first = tool(self.server, 'streamshot_act', forward, 401)['result']
+        self.assertEqual(json.loads(first['content'][0]['text'])['screen']['frame_id'], after_next)
+        self.assertEqual(first['content'][1]['type'], 'image')
+        self.client.next_frame = after_previous
+        backwards = act(frame_id=after_next, actions=[{'op': 'focus_previous'}])
+        second = tool(self.server, 'streamshot_act', backwards, 402)['result']
+        self.assertEqual(json.loads(second['content'][0]['text'])['screen']['frame_id'], after_previous)
+        target = {'op': 'focus_activate', 'observed_focus': '辅助功能'}
+        stale = tool(self.server, 'streamshot_act', act(frame_id=after_next, actions=[target]), 403)['result']
+        self.assertEqual(json.loads(stale['content'][0]['text'])['error'], 'observe_again')
+        self.client.next_frame = after_activate
+        activation = act(frame_id=after_previous, actions=[target])
+        third = tool(self.server, 'streamshot_act', activation, 404)['result']
+        self.assertEqual(json.loads(third['content'][0]['text'])['screen']['frame_id'], after_activate)
+        self.assertEqual(third['content'][1]['type'], 'image')
+        self.assertNotIn(target['observed_focus'], third['content'][0]['text'])
+        before = copy.deepcopy(self.client.calls)
+        replay = tool(self.server, 'streamshot_act', activation, 404)['result']
+        self.assertTrue(json.loads(replay['content'][0]['text'])['replayed'])
+        self.assertEqual(self.client.calls, before)
+        sent = [item[2] for item in self.client.calls if item[1] == '/v1/actions']
+        self.assertEqual([(item['usage'], item['modifiers'], item['frame_id']) for item in sent],
+                         [(43, 0, FRAME), (43, 0, FRAME), (43, 2, after_next), (44, 0, after_previous)])
+        self.assertTrue(all(item['op'] == 'key' and 'observed_focus' not in item for item in sent))
+
+    def test_focus_cannot_batch_activations_or_act_without_a_resulting_capture(self):
+        self.tools.keyboard_focus_enabled = True
+        initialize(self.server)
+        next_focus = {'op': 'focus_next'}
+        activate = {'op': 'focus_activate', 'observed_focus': 'Display & Text Size'}
+        invalid = [act(actions=[next_focus, activate]), act(actions=[activate, next_focus]),
+                   act(actions=[next_focus, next_focus]), act(actions=[next_focus], capture=False),
+                   act(actions=[activate], capture=False), act(actions=[dict(activate, count=2)]),
+                   act(actions=[{'op': 'focus_activate'}])]
+        invalid.extend(act(actions=[dict(next_focus, count=count)]) for count in (0, 4, True, '2'))
+        invalid.extend(act(actions=[dict(activate, observed_focus=label)])
+                       for label in ('', '  ', 'a\nb', 'a' * 121, True))
+        for identity, args in enumerate(invalid, 420):
+            self.assertEqual(tool(self.server, 'streamshot_act', args, identity)['error']['code'], -32602)
+        self.factory.assert_not_called()
+
+    def test_named_focus_requires_a_new_image_if_raw_input_used_the_observation(self):
+        self.tools.keyboard_focus_enabled = True
+        initialize(self.server)
+        tool(self.server, 'streamshot_get_screen', identity=440)
+        tool(self.server, 'streamshot_control', dict(frame_id=FRAME, session_id=SESSION,
+                                                      op='key', usage=43, modifiers=0), 441)
+        before = copy.deepcopy(self.client.calls)
+        result = tool(self.server, 'streamshot_act', act(actions=[{
+            'op': 'focus_activate', 'observed_focus': 'Old highlighted item'}]), 442)['result']
+        self.assertEqual(json.loads(result['content'][0]['text'])['error'], 'observe_again')
+        self.assertEqual(self.client.calls, before)
+
     def test_act_accepts_at_most_sixteen_printable_ascii_taps_and_never_implicit_submit(self):
         printable = ''.join(chr(code) for code in range(32, 127))
         for offset in range(0, len(printable), 16):
@@ -698,6 +766,18 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('image', replies[3]['result']['content'][0]['type'])
         self.assertNotIn('PRIVATE_INVALID_JSON', output.getvalue())
         self.assertTrue(all(isinstance(item, list) or item['jsonrpc'] == '2.0' for item in replies))
+
+    def test_stdio_desktop_opt_in_advertises_focus_only_for_this_client(self):
+        messages = [request('initialize', params={'protocolVersion': '2025-03-26', 'capabilities': {},
+                    'clientInfo': {'name': 'fixture', 'version': '1'}}),
+                    {'jsonrpc': '2.0', 'method': 'notifications/initialized'}, request('tools/list', 2)]
+        for opt_in in ('0', '1'):
+            with self.subTest(opt_in=opt_in), patch.dict(mcp.os.environ, STREAMSHOT_IOS_FULL_KEYBOARD_ACCESS=opt_in):
+                source = io.StringIO('\n'.join(json.dumps(item) for item in messages) + '\n')
+                output = io.StringIO()
+                mcp.run_mcp(Path('/fixture'), source, output, self.factory, runtime_factory=FakeRuntime)
+                self.assertEqual('focus_activate' in output.getvalue(), opt_in == '1')
+        self.factory.assert_not_called()
 
     def test_missing_configuration_is_lazy_and_redacted_tool_error(self):
         self.factory.side_effect = RuntimeError('PRIVATE_PATH_AND_TOKEN')

@@ -36,7 +36,7 @@ function view(result) {
 }
 
 export class StreamShotSession {
-  static async start({ python = 'python3', serialPort, state, timeoutMs = 30000 } = {}) {
+  static async start({ python = 'python3', serialPort, state, timeoutMs = 30000, fullKeyboardAccess = false } = {}) {
     if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60000) throw new Error('invalid_timeout');
     const entry = fileURLToPath(new URL('./streamshot/streamshot_bridge.py', import.meta.url));
     const args = [entry, ...(state ? ['--state', state] : []), 'mcp'];
@@ -44,7 +44,9 @@ export class StreamShotSession {
         !/^\/dev\/cu\.(?:usbmodem|usbserial)[A-Za-z0-9_.-]*$/.test(serialPort))) throw new Error('invalid_serial_port');
     // /usr/bin/env sets just this explicit selection. This also works in
     // restricted Node REPLs without accessing a global process object.
-    const launch = [`STREAMSHOT_SERIAL_PORT=${serialPort ?? ''}`, python, ...args];
+    if (typeof fullKeyboardAccess !== 'boolean') throw new Error('invalid_full_keyboard_access');
+    const launch = [`STREAMSHOT_SERIAL_PORT=${serialPort ?? ''}`,
+      `STREAMSHOT_IOS_FULL_KEYBOARD_ACCESS=${fullKeyboardAccess ? '1' : '0'}`, python, ...args];
     const session = new StreamShotSession(spawn('/usr/bin/env', launch, { stdio: ['pipe', 'pipe', 'pipe'] }), timeoutMs);
     try {
       await session.request('initialize', { protocolVersion: '2025-03-26', capabilities: {},

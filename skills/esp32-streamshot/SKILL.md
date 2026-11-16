@@ -32,6 +32,24 @@ Example for an already focused search field:
 
 Use the tool's actual schema. `type` is bounded ASCII HID typing, not clipboard or Unicode injection. Chinese entry needs an observed iPhone IME and candidate selection. Relative motion is not an absolute tap coordinate. See [operation details](references/operations.md) for the action schema and persistent-session fallback.
 
+## Visible focus and optional fast vision
+
+Relative mouse movement can work without the pointer being present in a captured
+image. Do not guess an absolute position or click an unobserved pointer. If the
+owner has enabled iPhone Full Keyboard Access with default keys, start the
+desktop adapter with `STREAMSHOT_IOS_FULL_KEYBOARD_ACCESS=1`, or pass
+`fullKeyboardAccess: true` to `StreamShotSession.start`. Use `focus_next` /
+`focus_previous` to move (at most 3 items for a known ordering). Only after a
+new image visibly confirms the highlighted target, issue `focus_activate`
+separately with the matching `observed_focus` label. A key ACK alone never
+confirms highlight or activation. If ReplayKit provides no new image, do not
+repeat input, infer that it failed, or reuse the previous image.
+
+The [optional fast advisor](references/fast-vision.md) can help identify visible
+focus using the already signed-in Codex service and standard usage. It never
+sends HID input. Only use it for an image the owner intends to share with that
+service; continue with the main agent if the advisor is slow or uncertain.
+
 ## Interruptions
 
 - `observe_again`: inspect a fresh image; never extend freshness or invent observations.
