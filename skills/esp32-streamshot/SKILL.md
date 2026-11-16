@@ -17,10 +17,10 @@ Start with `streamshot_status`. If sharing is inactive, have the owner start the
 
 Establish a working Home/Search route during setup, before timing a task. AssistiveTouch's visible menu or an explicitly configured device button can provide Home. Do not assume Command-H or Command-Space works on an unverified generic BLE keyboard; use the observed device configuration.
 
-1. Get and inspect `streamshot_get_screen`. Keep its session_id and frame_id; observations expire after 30 seconds.
-2. Prefer `streamshot_act` for a short, predetermined action on the visible UI. It performs up to 16 primitive HID operations, then briefly waits and requests a new image in the same call. Read both acknowledgements and image.
-3. Batch typing into an identified field, or a bounded move/click at a known target. Stop at a UI decision: inspect the new page before typing or sending. Do not use a long macro based on guessed future screens.
-4. For a transition image, request one settled image. A serial ACK proves the board accepted input, not that the phone performed the intended action.
+1. Inspect `streamshot_get_screen` once. Reuse the last usable observation without another request while its `session_id`/`frame_id` is still valid, the view has not changed, and no input has intervened. Observations expire after 30 seconds; before the first image there is nothing to reuse.
+2. Choose the target from that image. Prefer pointing and clicking, or wheel scrolling within a known scrollable view. Neither requires keyboard focus. The current ESP32 reports **relative** mouse movement: aim only from a known pointer position with a verified mapping. There is no `tap(x,y)` or touchscreen swipe in this build. If the pointer position is unknown, do not guess it from the position of the target on the image.
+3. Use `streamshot_act` for a short action or batch (up to 16 primitives), such as moving and clicking a known target or typing into an identified field. The bridge can start collecting frames before sending input and return one image with the receipt. Aim to see the result within about a second; take a usable result as soon as it arrives. Leave the default settle timing unless the known transition needs a longer hold. Do not sleep for a second before asking for a frame.
+4. Check the expected visible result before the next UI decision. A serial ACK only shows the board accepted the input. An image captured too early, or no new image, leaves the result unconfirmed. Keep the old image for context only and seek an observation if needed; do not send the action again just because the window ended.
 
 Keep the normal loop to image → one UI decision → a short act returning its image. Reuse the same session; avoid status checks, environment discovery or shortcut research between successful steps. If setup is missing, record the attempt as incomplete and finish setup separately. Measure the complete task, including model decisions and failed waits, rather than reporting only `input_ms` or a fast sample.
 
@@ -30,23 +30,18 @@ Example for an already focused search field:
 {"session_id":"<current>","frame_id":"<current>","actions":[{"op":"type","text":"WeChat"}],"capture":true,"settle_ms":250}
 ```
 
-Use the tool's actual schema. `type` is bounded ASCII HID typing, not clipboard or Unicode injection. Chinese entry needs an observed iPhone IME and candidate selection. Relative motion is not an absolute tap coordinate. See [operation details](references/operations.md) for the action schema and persistent-session fallback.
+Use the tool's actual schema. `type` is bounded ASCII HID typing, not clipboard or Unicode injection. Chinese entry needs an observed iPhone IME and candidate selection. See [operation details](references/operations.md) for the action schema and persistent-session fallback.
 
-## Visible focus and optional fast vision
+## Optional keyboard navigation
 
-Relative mouse movement can work without the pointer being present in a captured
-image. Do not guess an absolute position or click an unobserved pointer. If the
-owner has enabled iPhone Full Keyboard Access with default keys, start the
-desktop adapter with `STREAMSHOT_IOS_FULL_KEYBOARD_ACCESS=1`, or pass
+Use this only as a fallback when pointer navigation is unavailable in that view
+and the owner has enabled iPhone Full Keyboard Access with default keys. Start
+the desktop adapter with `STREAMSHOT_IOS_FULL_KEYBOARD_ACCESS=1`, or pass
 `fullKeyboardAccess: true` to `StreamShotSession.start`. Use `focus_next` /
 `focus_previous` to move (at most 3 items for a known ordering). Only after a
 new image visibly confirms the highlighted target, issue `focus_activate`
-separately with the matching `observed_focus` label. A key ACK alone never
-confirms highlight or activation. If ReplayKit provides no new image, do not
-repeat input or infer it failed. A standalone `streamshot_get_screen` with
-`cached_on_silence:true` may show a recent previously requested image for
-context only. It displays the original age, and cannot authorize keyboard,
-mouse, or a fast focus decision. This option never proves an action's result.
+separately with the matching `observed_focus` label. Focus checks apply to this
+keyboard fallback, not to pointing or scrolling.
 
 The [optional fast advisor](references/fast-vision.md) can help identify visible
 focus using the already signed-in Codex service and standard usage. It never
@@ -56,6 +51,7 @@ service; its review helper hands the same image to the main agent if the advisor
 ## Interruptions
 
 - `observe_again`: inspect a fresh image; never extend freshness or invent observations.
+- `cached_on_silence:true` can show a recent, previously requested image for context. It preserves the original age and cannot authorize input or verify its result. Prefer using an already valid observation over requesting this read-only preview.
 - Partial completion: stop and read which actions were acknowledged. If an input outcome is unknown or `control_reset_required` is present, reset desktop control, inspect a new image and decide what remains. For a known not-sent `observe_again`, obtain a new image without an unnecessary reset. Never resend the entire batch under a new ID. Reset does not start or stop sharing.
 - Capture timeout after ACK: input may already have succeeded. Request an image, not a replay. An RPC replay returns the input receipt and omits the old image.
 - Temporary network faults may reconnect within the live broadcast. True system finish, explicit Stop or expiry requires the owner's new system broadcast. `owner_end` alone does not prove a manual stop.
