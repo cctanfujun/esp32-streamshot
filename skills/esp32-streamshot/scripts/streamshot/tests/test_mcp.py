@@ -512,6 +512,49 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(self.tools._elapsed_ms(0, 1000000), mcp.MAX_TIMING_MS)
         self.assertEqual(self.tools._elapsed_ms(2, 1), 0)
 
+    def test_omitted_settle_is_shorter_only_for_actions_without_known_navigation(self):
+        initialize(self.server)
+        move = {'op': 'move', 'dx': 30, 'dy': -2}
+        scroll = {'op': 'scroll', 'dy': 2}
+        typing = {'op': 'type', 'text': 'ok'}
+        click = {'op': 'click', 'button': 'left'}
+        key = {'op': 'key', 'usage': 40, 'modifiers': 0}
+        cases = [
+            ([move], {}, 60), ([move, scroll], {}, 120), ([typing], {}, 110),
+            ([move, click], {}, 250), ([key], {}, 250), ([move], {'settle_ms': 430}, 430),
+        ]
+        for index, (steps, override, expected) in enumerate(cases):
+            with self.subTest(steps=steps, override=override):
+                self.client.next_frame = str(uuid.uuid4())
+                tool(self.server, 'streamshot_get_screen', identity=300 + 2 * index)
+                args = act(frame_id=self.client.next_frame, actions=steps, **override)
+                result = tool(self.server, 'streamshot_act', args, 301 + 2 * index)['result']
+                self.assertFalse(result['isError'])
+                summary = json.loads(result['content'][0]['text'])
+                self.assertEqual(summary['requested_settle_ms'], expected)
+                self.assertEqual(self.client.calls[-1], ('POST', '/v1/screen', {'settle_ms': expected}, True))
+
+    def test_local_observation_expiring_during_prepare_closes_empty_window_without_input(self):
+        initialize(self.server)
+        tool(self.server, 'streamshot_get_screen', identity=320)
+        window = str(uuid.uuid4())
+
+        def prepare(value):
+            self.clock.return_value = 131
+            return window
+
+        self.client.prepare_window = prepare
+        self.client.request = Mock(side_effect=mcp.SafeFailure('screen_window_unavailable'))
+        result = tool(self.server, 'streamshot_act', act(), 321)['result']
+        summary = json.loads(result['content'][0]['text'])
+        self.assertEqual(summary['results'][0]['status'], 'not_sent')
+        self.assertEqual(summary['results'][0]['error'], 'observe_again')
+        self.assertEqual(summary['screen_status'], 'not_requested')
+        self.assertEqual(summary['capture_ms'], 0)
+        self.assertFalse(self.tools.control_reset_required)
+        self.client.request.assert_called_once_with('POST', '/v1/screen/finish',
+            {'request_id': window, 'settle_ms': 0}, image=True)
+
     def test_new_capture_metrics_anchor_freshness_to_request_not_upload_completion(self):
         initialize(self.server)
         original = self.client.request
@@ -890,6 +933,48 @@ class StableOriginTLSTests(unittest.TestCase):
                 client.request('GET', '/v1/status')
         self.assertEqual(self.sni, ['uncovered-mac.local'])
         self.assertIsNone(self.session.frame)
+
+    def test_server_proves_stale_observation_sent_nothing_and_no_reset_or_capture_is_started(self):
+        controller = Mock()
+        self.session = mcp.bridge.Session(controller)
+        self.server.session = self.session
+        self.session.session(dict(v=1, session_id=SESSION, state='start'), principal='legacy')
+        server = mcp.MCP(mcp.Tools(self.directory))
+        initialize(server)
+        # A separately negotiated capture/geometry event can invalidate the
+        # bridge view while the MCP caller's frame is still locally timely.
+        server.tools.observation = dict(METADATA)
+        server.tools.observed_at = server.tools.clock()
+        result = tool(server, 'streamshot_act', act(), 222)['result']
+        summary = json.loads(result['content'][0]['text'])
+        self.assertTrue(result['isError'])
+        self.assertEqual((summary['acknowledged'], summary['screen_status']), (0, 'not_requested'))
+        self.assertEqual(summary['results'][0]['status'], 'not_sent')
+        self.assertEqual(summary['results'][0]['error'], 'observe_again')
+        self.assertFalse(server.tools.control_reset_required)
+        self.assertIsNone(server.tools.observation)
+        self.assertIsNone(self.session.pending)
+        controller.perform.assert_not_called()
+
+    def test_server_can_require_reset_before_preparing_input_without_pretending_frame_is_stale(self):
+        controller = Mock()
+        self.session = mcp.bridge.Session(controller)
+        self.server.session = self.session
+        self.session.session(dict(v=1, session_id=SESSION, state='start'), principal='legacy')
+        self.session.phone_capture_window = True
+        self.session.control_reset_required = True
+        server = mcp.MCP(mcp.Tools(self.directory))
+        initialize(server)
+        server.tools.observation = dict(METADATA)
+        server.tools.observed_at = server.tools.clock()
+        result = tool(server, 'streamshot_act', act(), 223)['result']
+        summary = json.loads(result['content'][0]['text'])
+        self.assertTrue(result['isError'])
+        self.assertEqual((summary['acknowledged'], summary['results']), (0, []))
+        self.assertEqual(summary['screen_error'], 'control_reset_required')
+        self.assertTrue(server.tools.control_reset_required)
+        self.assertIsNone(self.session.pending)
+        controller.perform.assert_not_called()
 
     def test_act_over_real_tls_uses_one_lease_and_stops_if_screen_session_changes(self):
         for change_session in (False, True):

@@ -126,6 +126,27 @@ class StateChecks(unittest.TestCase):
         self.assertIsNone(state.pending)
         self.assertEqual(self.controller.calls, [])
 
+    def test_delayed_phone_ready_cannot_extend_observation_age(self):
+        state = bridge.Session(self.controller, self.clock)
+        state.session(dict(v=1, session_id=self.session, state='start', capture_protocol=bridge.CAPTURE_PROTOCOL))
+        with concurrent.futures.ThreadPoolExecutor(3) as pool:
+            result = pool.submit(state.capture, .5)
+            ticket = state.poll(self.session, .2, window=True)
+            state.accept_frame(dict(self.frame_headers(ticket['request_id']),
+                               **{'capture-wait-ms': '0', 'encode-ms': '0', 'callback-age-ms': '0'}), JPEG)
+            frame = result.result(1)
+            self.clock.now = 29.9
+            state.last_heartbeat = self.clock.now
+            prepared = pool.submit(state.prepare_window, dict(session_id=self.session, frame_id=frame['frame_id'],
+                                  command_ids=[self.action(frame, button='left')['id']]))
+            window = state.poll(self.session, .2, window=True)
+            self.clock.now = 30.1
+            ready = pool.submit(state.poll, self.session, window=True, ready=window['request_id'])
+            self.assertFailure('observe_again', prepared.result, 1)
+            self.assertIsNone(ready.result(1))
+        self.assertIsNone(state.pending)
+        self.assertEqual(self.controller.calls, [])
+
     def test_settle_ticket_is_explicit_and_window_metrics_do_not_renew_observation_age(self):
         state = bridge.Session(self.controller, self.clock)
         identity = str(uuid.uuid4())

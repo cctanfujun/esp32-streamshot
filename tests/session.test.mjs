@@ -137,6 +137,19 @@ test('act uses session-owned inspected metadata and requires inspection of its n
   await client.close();
 });
 
+test('act without an explicit hold leaves it to the bridge', async () => {
+  const seen=[];
+  const child=fake((message,process)=>{
+    seen.push(message.params);
+    answer(process,message,message.params.name==='streamshot_act'?actResult():screenResult());
+  });
+  const client=new StreamShotSession(child);
+  await client.inspect(await client.screen(),async()=>{});
+  await client.act([{op:'move',dx:10,dy:0}]);
+  assert.equal(Object.hasOwn(seen[1].arguments,'settle_ms'),false);
+  await client.close();
+});
+
 test('queued acts cannot reuse the observation consumed by the first act', async () => {
   const names=[];
   const child=fake((message,process)=>{

@@ -3,6 +3,7 @@
 Only this process's Popen children are stopped. An existing listener is adopted
 only after private-certificate TLS, the agent token and v1 status all validate.
 """
+from contextlib import contextmanager
 import errno
 import fcntl
 import hashlib
@@ -30,7 +31,8 @@ SAFE_CODES = frozenset(('runtime_network_unavailable', 'runtime_network_changed'
     'runtime_configuration_unavailable', 'runtime_already_running',
     'runtime_port_in_use', 'runtime_service_unavailable',
     'runtime_discovery_unavailable', 'runtime_discovery_upgrade_required',
-    'runtime_serial_configuration_conflict', 'runtime_sharing_upgrade_required', 'runtime_capture_upgrade_required'))
+    'runtime_serial_configuration_conflict', 'runtime_sharing_upgrade_required', 'runtime_capture_upgrade_required',
+    'runtime_operation_busy', 'runtime_input_not_configured'))
 
 
 class RuntimeFailure(Exception):
@@ -82,7 +84,7 @@ def _private_write(path, value):
         output.write(data)
 
 
-def discovery_identity(directory, config, network):
+def discovery_identity(directory, config, network, *, create=True):
     origin = config.get('originHost')
     if not origin:
         # A legacy IP certificate is kept intact; migration is an explicit step.
@@ -91,6 +93,8 @@ def discovery_identity(directory, config, network):
         raise RuntimeFailure('runtime_network_changed')
     path = Path(directory) / 'discovery.json'
     if not path.exists():
+        if not create:
+            raise RuntimeFailure('runtime_already_running')
         _private_write(path, {'version': 1, 'id': str(uuid.uuid4()),
                              'name': network['name'], 'originHost': origin})
     try:
@@ -200,6 +204,31 @@ def port_available(host, port):
         raise RuntimeFailure('runtime_network_changed') from None
 
 
+@contextmanager
+def operation_lock(state_dir):
+    """One local capture/input transaction at a time across MCP processes."""
+    directory = Path(state_dir).expanduser().absolute()
+    try:
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise RuntimeFailure('runtime_configuration_unavailable')
+        fd = os.open(directory / 'mcp-operation.lock',
+                     os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    except OSError:
+        raise RuntimeFailure('runtime_configuration_unavailable') from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise RuntimeFailure('runtime_configuration_unavailable')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeFailure('runtime_operation_busy') from None
+        yield
+    finally:
+        os.close(fd)
+
+
 class Runtime:
     def __init__(self, state_dir=bridge.STATE, serial_port=None, *,
                  network_factory=machine_network, request=authenticated_request,
@@ -235,18 +264,23 @@ class Runtime:
             if self.serial_port is not None and not re.fullmatch(
                     r'/dev/(?:cu\.(?:usbmodem|usbserial)[A-Za-z0-9_.-]*|tty(?:ACM|USB)[0-9]+)', self.serial_port):
                 raise RuntimeFailure('runtime_serial_configuration_conflict')
-            self._lock()
-            network = self.network_factory()
-            if not self.directory.exists():
-                bridge.init_state(self.directory, network['host'], 8765,
-                                  origin_host=network['originHost'], name=network['name'])
             try:
-                self.config = bridge.configuration(self.directory)
-            except Exception:
-                raise RuntimeFailure('runtime_configuration_unavailable') from None
-            if self.config['host'] != network['host']:
-                raise RuntimeFailure('runtime_network_changed')
-            self.identity = discovery_identity(self.directory, self.config, network)
+                self._lock()
+            except RuntimeFailure as error:
+                if error.code != 'runtime_already_running':
+                    raise
+                # An existing MCP may already be presenting/controlling the phone.
+                # Attach to the same authenticated backend; never launch or stop
+                # its server, create state, or publish its Bonjour record again.
+                self._configure(create=False)
+                try:
+                    response = self.request(self.directory, self.config)
+                except RuntimeFailure:
+                    raise RuntimeFailure('runtime_already_running') from None
+                validate_status(response, self.serial_port, require_discovery=True)
+                self.ready = True
+                return self
+            self._configure(create=True)
             try:
                 response = self.request(self.directory, self.config)
             except RuntimeFailure:
@@ -288,6 +322,21 @@ class Runtime:
         except Exception:
             self.close(); raise RuntimeFailure('runtime_service_unavailable') from None
 
+    def _configure(self, *, create):
+        network = self.network_factory()
+        if not self.directory.exists():
+            if not create:
+                raise RuntimeFailure('runtime_already_running')
+            bridge.init_state(self.directory, network['host'], 8765,
+                              origin_host=network['originHost'], name=network['name'])
+        try:
+            self.config = bridge.configuration(self.directory)
+        except Exception:
+            raise RuntimeFailure('runtime_configuration_unavailable') from None
+        if self.config['host'] != network['host']:
+            raise RuntimeFailure('runtime_network_changed')
+        self.identity = discovery_identity(self.directory, self.config, network, create=create)
+
     @staticmethod
     def _stop_child(child):
         if child is None or child.poll() is not None:
@@ -302,7 +351,7 @@ class Runtime:
                 except (OSError, subprocess.TimeoutExpired): pass
 
     def close(self):
-        if self.ready and self.config is not None:
+        if self.ready and self.config is not None and self.backend is not None and self.backend.poll() is None:
             try: self.request(self.directory, self.config, 'POST', '/v1/stop')
             except Exception: pass
         self.ready = False

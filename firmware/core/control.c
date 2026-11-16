@@ -260,7 +260,9 @@ ss_ack_t ss_execute(ss_control_t *control, const ss_request_t *request)
                 int8_t x = chunk(dx), y = chunk(dy);
                 if (!ready(control) || !control->io.mouse(control->io.context, 0, x, y, 0)) { sent = false; break; }
                 dx -= x; dy -= y;
-                control->io.sleep_ms(control->io.context, 10);
+                // Preserve pacing between reports of a large movement, but
+                // return the last report's acknowledgement without a delay.
+                if (dx || dy) control->io.sleep_ms(control->io.context, 10);
             } while (dx || dy);
             ack.ok = sent;
         } else if (request->op == SS_SCROLL) {
@@ -270,9 +272,15 @@ ss_ack_t ss_execute(ss_control_t *control, const ss_request_t *request)
             if (request->op == SS_CLICK) sent = control->io.mouse(control->io.context, (uint8_t)request->button, 0, 0, 0);
             else sent = control->io.keyboard(control->io.context, (uint8_t)request->modifiers, (uint8_t)request->usage);
             control->io.sleep_ms(control->io.context, 20);
-            // Release is attempted even when the press report fails.
-            bool released = neutral(control);
-            sent = sent && released;
+            // A successful tap needs a release on its own report channel.
+            // The other channel remains neutral; do not wait for an extra
+            // BLE report. Any uncertain send still takes the global neutral
+            // and latch path below rather than repeating the input.
+            if (sent) {
+                sent = request->op == SS_CLICK
+                    ? control->io.mouse(control->io.context, 0, 0, 0, 0)
+                    : control->io.keyboard(control->io.context, 0, 0);
+            }
             ack.ok = sent;
         }
     }

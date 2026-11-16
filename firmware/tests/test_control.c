@@ -13,7 +13,8 @@ static const char *BOOT = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 typedef struct {
     uint64_t time;
     int events, input_events, x, y, wheel, buttons, held_key;
-    bool fail_press;
+    int mouse_events, keyboard_events;
+    bool fail_press, fail_release;
 } fake_t;
 
 static bool mouse(void *context, uint8_t buttons, int8_t x, int8_t y, int8_t wheel)
@@ -21,6 +22,11 @@ static bool mouse(void *context, uint8_t buttons, int8_t x, int8_t y, int8_t whe
     fake_t *fake = context;
     assert(x >= -127 && y >= -127);
     fake->events++;
+    fake->mouse_events++;
+    if (!buttons && !x && !y && !wheel && fake->fail_release) {
+        fake->fail_release = false;
+        return false;
+    }
     fake->buttons = buttons;
     fake->x += x; fake->y += y; fake->wheel += wheel;
     if (buttons || x || y || wheel) {
@@ -33,6 +39,11 @@ static bool keyboard(void *context, uint8_t modifiers, uint8_t usage)
 {
     fake_t *fake = context;
     fake->events++;
+    fake->keyboard_events++;
+    if (!modifiers && !usage && fake->fail_release) {
+        fake->fail_release = false;
+        return false;
+    }
     fake->held_key = modifiers || usage;
     if (fake->held_key) {
         fake->input_events++;
@@ -235,6 +246,12 @@ static void movement_and_deadline(void)
     ss_request_t move = request(SS_MOVE, 2, 2, A); move.dx = 2048; move.dy = -2048;
     assert(ss_execute(&control, &move).ok);
     assert(fake.x == 2048 && fake.y == -2048 && fake.buttons == 0);
+    assert(fake.time == 160); // 17 reports, with pacing only between reports.
+    arm(&control, &fake);
+    ss_request_t short_move = request(SS_MOVE, 3, 2, A);
+    short_move.dx = 16; short_move.dy = -24;
+    assert(ss_execute(&control, &short_move).ok && fake.time == 0);
+    assert(fake.x == 16 && fake.y == -24);
     arm(&control, &fake);
     fake.time = control.expires_ms - 5;
     assert(!ss_execute(&control, &move).ok);
@@ -242,10 +259,43 @@ static void movement_and_deadline(void)
     puts("bounded relative reports and deadline checked during movement: passed");
 }
 
+static void tap_channels_and_failure_cleanup(void)
+{
+    ss_control_t control;
+    fake_t fake;
+    arm(&control, &fake);
+    int mouse_before = fake.mouse_events, keyboard_before = fake.keyboard_events;
+    ss_request_t click = request(SS_CLICK, 2, 2, A); click.button = 1;
+    ss_request_t key = request(SS_KEY, 3, 3, A); key.usage = 4;
+    assert(ss_execute(&control, &click).ok);
+    assert(fake.mouse_events == mouse_before + 2 && fake.keyboard_events == keyboard_before);
+    assert(fake.buttons == 0 && fake.time == 20);
+    assert(ss_execute(&control, &key).ok);
+    assert(fake.mouse_events == mouse_before + 2 && fake.keyboard_events == keyboard_before + 2);
+    assert(fake.held_key == 0 && fake.time == 40);
+
+    for (int stage = 0; stage < 2; stage++) {
+        arm(&control, &fake);
+        fake.fail_press = stage == 0;
+        fake.fail_release = stage == 1;
+        mouse_before = fake.mouse_events;
+        keyboard_before = fake.keyboard_events;
+        ss_ack_t ack = ss_execute(&control, &click);
+        assert(!ack.ok && !ack.armed && !strcmp(ack.error, "hid_failed"));
+        assert(fake.mouse_events == mouse_before + 2 + stage);
+        assert(fake.keyboard_events == keyboard_before + 1);
+        assert(fake.buttons == 0 && fake.held_key == 0 && fake.input_events == 1);
+        int after = fake.events;
+        assert(!ss_execute(&control, &click).ok && fake.events == after);
+    }
+    puts("tap releases only its own channel, failed press/release neutralize both: passed");
+}
+
 int main(void)
 {
     parsing(); framing(); unarmed_and_taps(); deduplication_and_sequence();
     stop_disconnect_expiry_and_failure(); movement_and_deadline();
-    puts("All 6 host safety suites passed (ASan + UBSan).");
+    tap_channels_and_failure_cleanup();
+    puts("All 7 host safety suites passed (ASan + UBSan).");
     return 0;
 }

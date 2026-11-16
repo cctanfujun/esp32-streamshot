@@ -23,7 +23,7 @@ function view(result) {
     ? { ...metadata } : null;
   const summary = {};
   for (const key of ['ok', 'status', 'error', 'requested', 'acknowledged', 'retryInput',
-    'input_ms', 'capture_prepare_ms', 'capture_ms', 'total_ms', 'screen_status', 'screen_error']) {
+    'input_ms', 'capture_prepare_ms', 'requested_settle_ms', 'capture_ms', 'total_ms', 'screen_status', 'screen_error']) {
     if (data?.[key] !== undefined) summary[key] = data[key];
   }
   if (Array.isArray(data?.results)) {
@@ -136,7 +136,7 @@ export class StreamShotSession {
 
   trace(name, timing, data) {
     const entry = { tool: name, ...timing };
-    for (const key of ['input_ms', 'capture_prepare_ms', 'capture_ms', 'total_ms', 'acknowledged', 'requested', 'screen_status']) {
+    for (const key of ['input_ms', 'capture_prepare_ms', 'requested_settle_ms', 'capture_ms', 'total_ms', 'acknowledged', 'requested', 'screen_status']) {
       if (data?.[key] !== undefined) entry[key] = data[key];
     }
     for (const key of ['source_callback_offset_ms', 'input_relation']) {
@@ -226,13 +226,13 @@ export class StreamShotSession {
     return { observed, ...context.timing, display_ms: elapsed(started, inspectedAt) };
   }
 
-  act(actions, { capture = true, settle_ms = 250, id } = {}) {
+  act(actions, { capture = true, settle_ms, id } = {}) {
     if (this.uncertain) return Promise.reject(new Error('reset_control_required_after_unknown_input'));
     const observation = this.observation;
     if (!observation) return Promise.reject(new Error('fresh_observed_screen_required'));
     return this.enqueue('streamshot_act', () => ({
       session_id: observation.frame.session_id, frame_id: observation.frame.frame_id,
-      actions, capture, settle_ms,
+      actions, capture, ...(settle_ms === undefined ? {} : { settle_ms }),
     }), { id }, observation);
   }
 

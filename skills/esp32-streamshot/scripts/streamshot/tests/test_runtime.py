@@ -220,12 +220,49 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(runtime.RuntimeFailure, '^' + code + '$'): runner.start()
         self.assertEqual(self.commands, [])
 
-    def test_single_owner_lock_and_cleanup_release(self):
+    def test_owned_runtime_can_be_attached_without_publishing_or_stopping(self):
         one = self.instance(); self.addCleanup(one.close); one.start()
+        self.events.clear()
         two = self.instance()
-        with self.assertRaisesRegex(runtime.RuntimeFailure, '^runtime_already_running$'): two.start()
+        self.addCleanup(two.close); two.start()
+        self.assertTrue(two.ready)
+        self.assertEqual(two.identity, one.identity)
+        self.assertIsNone(two.lock_fd)
+        self.assertIsNone(two.backend)
+        self.assertIsNone(two.publisher)
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(self.events, [('request', '/v1/status')])
+        two.close()
+        self.assertEqual(self.events, [('request', '/v1/status')])
         one.close()
         two.start(); two.close()
+
+    def test_contender_cannot_create_state_or_start_a_listener_without_auth(self):
+        one = self.instance(); self.addCleanup(one.close); one.start()
+        with patch.object(runtime.bridge, 'init_state') as init:
+            (self.state / 'discovery.json').unlink()
+            request = Mock()
+            with self.assertRaisesRegex(runtime.RuntimeFailure, '^runtime_already_running$'):
+                self.instance(request=request).start()
+            init.assert_not_called(); request.assert_not_called()
+        self.assertEqual(len(self.commands), 1)
+
+    def test_contender_with_wrong_usb_selection_cannot_adopt(self):
+        one = self.instance(); self.addCleanup(one.close); one.start()
+        with self.assertRaisesRegex(runtime.RuntimeFailure, '^runtime_serial_configuration_conflict$'):
+            self.instance(serial_port='/dev/cu.usbmodemOTHER').start()
+        self.assertEqual(len(self.commands), 1)
+
+    def test_local_operation_lock_is_nonblocking_and_releases_after_error(self):
+        with self.assertRaisesRegex(RuntimeError, '^in flight$'):
+            with runtime.operation_lock(self.state):
+                with self.assertRaisesRegex(runtime.RuntimeFailure, '^runtime_operation_busy$'):
+                    with runtime.operation_lock(self.state):
+                        self.fail('concurrent capture or input must not start')
+                raise RuntimeError('in flight')
+        with runtime.operation_lock(self.state):
+            lock = self.state / 'mcp-operation.lock'
+            self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
 
     def test_failed_publisher_stops_only_owned_children(self):
         def spawn(args, **kwargs):
@@ -234,7 +271,7 @@ class RuntimeTests(unittest.TestCase):
             return child
         runner = self.instance(popen=spawn)
         with self.assertRaisesRegex(runtime.RuntimeFailure, '^runtime_discovery_unavailable$'): runner.start()
-        self.assertEqual(self.events[-1], ('request', '/v1/stop'))
+        self.assertNotIn(('request', '/v1/stop'), self.events)
         self.assertEqual(len(self.children), 1)
 
     def test_invalid_serial_is_rejected_before_local_or_network_actions(self):

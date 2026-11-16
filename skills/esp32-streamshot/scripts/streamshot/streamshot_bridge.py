@@ -43,6 +43,8 @@ FRAME_TIMINGS = {'capture-wait-ms': 'capture_wait_ms', 'encode-ms': 'encode_ms',
                  'callback-age-ms': 'source_callback_age_ms'}
 WINDOW_CALLBACK_HEADER = 'callback-offset-ms'
 WINDOW_INPUT_RELATIONS = frozenset(('before_last_input', 'during_last_input', 'after_last_ack', 'uncertain'))
+INPUT_OBSERVATION_ERRORS = frozenset(('observe_again', 'control_reset_required',
+                                      'previous_input_unknown_observe_again'))
 SCREEN_INACTIVE_REASONS = frozenset(('owner_pause', 'owner_end', 'agent_stop',
                                    'heartbeat_timeout', 'lease_expired', 'bridge_shutdown'))
 
@@ -561,6 +563,16 @@ class Session:
         if principal is not None and self.owner != principal:
             raise Failure('session_owner_mismatch', 403)
 
+    def _require_input_observation(self, frame_id):
+        if self.control_reset_required:
+            raise Failure('control_reset_required', 409)
+        if (self.frame is None or self.frame['frame_id'] != frame_id
+                or self.frame['observation_epoch'] != self.observation_epoch
+                or not self.frame.get('usable_for_input', True)):
+            raise Failure('observe_again', 409)
+        if self.unknown:
+            raise Failure('previous_input_unknown_observe_again', 409)
+
     def session(self, value, principal=None):
         if not isinstance(value, dict):
             raise Failure('invalid_fields')
@@ -830,10 +842,7 @@ class Session:
             self._require(value['session_id'])
             if not self.phone_capture_window:
                 return {'request_id': None}
-            if (self.frame is None or self.frame['frame_id'] != value['frame_id']
-                    or self.frame['observation_epoch'] != self.observation_epoch
-                    or not self.frame.get('usable_for_input', True) or self.control_reset_required or self.unknown):
-                raise Failure('observe_again', 409)
+            self._require_input_observation(value['frame_id'])
             if self.pending is not None or self.capture_busy or self.input_busy or self.control_reset_busy:
                 raise Failure('capture_busy', 409)
             if any(command in self.commands for command in value['command_ids']):
@@ -846,6 +855,13 @@ class Session:
             self.result = None
             self.condition.notify_all()
             self.condition.wait_for(lambda: self.pending is not pending or 'ready_at' in pending, timeout)
+            self._require(value['session_id'])
+            try:
+                self._require_input_observation(value['frame_id'])
+            except Failure:
+                if self.pending is pending:
+                    self._cancel_window()
+                raise
             if (self.pending is pending and 'ready_at' in pending
                     and pending['observation_epoch'] == self.observation_epoch):
                 return {'request_id': pending['id']}
@@ -903,14 +919,12 @@ class Session:
                 if window_id is not None and (self.pending is None or self.pending['id'] != window_id
                                               or not self.pending.get('commands')):
                     raise Failure('capture_window_unavailable', 409)
-                if self.control_reset_required:
-                    raise Failure('control_reset_required', 409)
-                if (self.frame is None or self.frame['frame_id'] != value['frame_id']
-                        or self.frame.get('observation_epoch') != self.observation_epoch
-                        or not self.frame.get('usable_for_input', True)):
-                    raise Failure('observe_again', 409)
-                if self.unknown:
-                    raise Failure('previous_input_unknown_observe_again', 409)
+                try:
+                    self._require_input_observation(value['frame_id'])
+                except Failure:
+                    if window_id is not None and 'last_input_at' not in self.pending:
+                        self._cancel_window()
+                    raise
             if self.input_busy or self.control_reset_busy:
                 raise Failure('input_in_progress', 409)
             if len(self.commands) >= 4096:
@@ -1163,6 +1177,10 @@ class Handler(BaseHTTPRequestHandler):
                            'capture_window_unavailable': 'window_unavailable'}.get(value.get('error'))
             if disposition is not None:
                 self.send_header('X-StreamShot-Capture-Error', disposition)
+            if (status == 409 and self.path in ('/v1/actions', '/v1/screen/prepare')
+                    and value.get('error') in INPUT_OBSERVATION_ERRORS):
+                # This disposition is only raised before any input is sent.
+                self.send_header('X-StreamShot-Input-Error', value['error'])
         if metadata:
             for key in ('frame_id', 'session_id', 'width', 'height', 'orientation', 'geometry_epoch'):
                 self.send_header('X-StreamShot-' + key.replace('_', '-'), str(metadata[key]))

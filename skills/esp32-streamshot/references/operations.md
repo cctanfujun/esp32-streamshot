@@ -2,7 +2,7 @@
 
 Use native MCP tools when available. A task normally needs one status check, one observed image, then short `streamshot_act` calls separated by real UI decisions. Do not rediscover the environment for each key.
 
-`streamshot_act` takes `session_id`, `frame_id`, `actions`, optional `capture` (default true), and `settle_ms` (default 250, max 1000). Expanded actions are limited to 16 primitives:
+`streamshot_act` takes `session_id`, `frame_id`, `actions`, optional `capture` (default true), and optional `settle_ms` (0–1000 ms). When omitted, the current bridge uses 60 ms for relative movement only, 120 ms for scrolling, 110 ms for a single typing operation, and 250 ms for clicks, keys and mixed controls. Expanded actions are limited to 16 primitives:
 
 ```json
 {"op":"move","dx":16,"dy":-32}
@@ -46,7 +46,7 @@ Inspect that image before the next call. For an already identified, focused fiel
 await phone.inspect(await phone.act([{op:'type',text:'WeChat'}]), displayPhone);
 ```
 
-`screen()` forwards optional `settle_ms` (0–1000, default 0); `act()` defaults to capture=true and settle_ms=250. A failed capture, reset, stop, changed session or superseding request clears the usable observation. Queued acts cannot reuse a frame already consumed by another act. The existing server still enforces source age, session and geometry; the helper never extends freshness. Low-level `call()` remains available for status/reset/stop and explicit tool schemas.
+`screen()` forwards optional `settle_ms` (0–1000, default 0); `act()` leaves the hold to the bridge unless explicitly set. A failed capture, reset, stop, changed session or superseding request clears the usable observation. Queued acts cannot reuse a frame already consumed by another act. The existing server still enforces source age, session and geometry; the helper never extends freshness. Low-level `call()` remains available for status/reset/stop and explicit tool schemas.
 
 The display callback emits decoded image bytes and a compact receipt. Successful per-key UUID lists stay in the returned result; partial failures remain in the displayed summary. Never print the raw response/base64. Keep the session alive between calls; `await phone.close()` closes only its own child. If another runtime owns the state, use the existing tools rather than killing it or rotating trust.
 
